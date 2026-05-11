@@ -1,418 +1,503 @@
-// Node.js Backend Server
-// Run: npm install ws
-// Start: node server.js
+// Core Wars - Optimized Server
+// npm install ws  →  node server.js
+//
+// Optimizations applied:
+//  • 30 Hz tick loop, 15 Hz snapshot broadcast (every 2nd tick)
+//  • Compact JSON keys throughout (t, i, x, y, ph, tm, …)
+//  • Projectiles sent as spawn/destroy EVENTS only — client simulates motion
+//  • Buildings sent as add/remove EVENTS only — not in every snapshot
+//  • Event queue flushed once per snapshot (never mid-tick)
+//  • Input-only from client (no position in client→server traffic)
+//  • Input sent only when changed (client-side delta guard)
+//  • 8-player hard cap per room
+//  • Room deleted immediately when empty
+//  • dt capped to avoid spiral-of-death on lag spike
 
 const WebSocket = require('ws');
-const crypto = require('crypto');
-const http = require('http');
+const crypto    = require('crypto');
+const http      = require('http');
 
-// Setup standard HTTP server and attach WebSocket server
 const server = http.createServer();
-const wss = new WebSocket.Server({ server });
-// Use the environment's port if available, otherwise default to 3000
-const PORT = process.env.PORT || 3000;
+const wss    = new WebSocket.Server({ server });
+const PORT   = process.env.PORT || 3000;
 
-// Game Constants
-const TICK_RATE = 30; // 30 FPS server-side logic
-const MAP_WIDTH = 2000;
-const MAP_HEIGHT = 1200;
-const PHASES = { LOBBY: 0, BUILD: 1, ATTACK: 2, END: 3 };
-const BUILD_TIME = 30; // seconds
+// ─── Constants ───────────────────────────────────────────────────────────────
+const TICK_RATE   = 30;          // Hz — physics / logic
+const SNAP_EVERY  = 2;           // broadcast every Nth tick → 15 Hz
+const MAP_W       = 2000;
+const MAP_H       = 1200;
+const MAX_PLAYERS = 8;
+const BUILD_TIME  = 30;          // seconds
 
-// Game State Storage
-const rooms = new Map(); // roomId -> Room object
-const clients = new Map(); // ws -> { id, roomId }
+// Phase IDs (keep numeric — cheaper JSON)
+const PH = { LOBBY: 0, BUILD: 1, ATTACK: 2, END: 3 };
 
+// Event type IDs (numeric = most compact in JSON)
+const EV = {
+    PHASE_CHANGE : 0,
+    PLAYER_HIT   : 1,
+    PLAYER_DIE   : 2,
+    PLAYER_SPAWN : 3,
+    PROJ_SPAWN   : 4,
+    PROJ_DESTROY : 5,
+    BUILD_ADD    : 6,
+    BUILD_DESTROY: 7,
+    BUILD_HIT    : 8,
+    CORE_HIT     : 9,
+    WIN          : 10,
+};
+
+// ─── Global state ────────────────────────────────────────────────────────────
+const rooms   = new Map(); // roomId → Room
+const clients = new Map(); // ws     → { id, roomId }
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+const dist      = (x1,y1,x2,y2) => Math.hypot(x2-x1, y2-y1);
+const clamp     = (v,lo,hi)      => Math.max(lo, Math.min(hi, v));
+const shortId   = ()             => crypto.randomBytes(3).toString('hex'); // 6-char hex
+
+function circleRect(cx, cy, cr, rx, ry, rw, rh) {
+    const tx = clamp(cx, rx, rx + rw);
+    const ty = clamp(cy, ry, ry + rh);
+    return (cx-tx)**2 + (cy-ty)**2 <= cr*cr;
+}
+
+// Strip building to wire format
+function wireBuild(b) {
+    // Only fields the client needs; omit internals (ls, etc.)
+    return { i: b.id, tp: b.type, tm: b.team, x: Math.round(b.x), y: Math.round(b.y),
+             hp: b.hp, mhp: b.maxHp, r: b.r || 0 };
+}
+
+// ─── Room ────────────────────────────────────────────────────────────────────
 class Room {
     constructor(id) {
-        this.id = id;
-        this.players = new Map(); // id -> Player data
-        this.state = PHASES.LOBBY;
-        this.timer = 0; // Seconds left for current phase
-        this.tickInterval = null;
-        
-        // Game Entities
-        this.projectiles = [];
-        this.buildings = []; // Walls & Turrets
+        this.id        = id;
+        this.players   = new Map();   // playerId → player object
+        this.buildings = new Map();   // buildId  → building object
+        this.projs     = new Map();   // projId   → projectile object
+
+        this.phase     = PH.LOBBY;
+        this.timer     = 0;
+        this.winner    = -1;
+        this.tickCount = 0;
+        this.events    = [];          // flushed each snapshot
+
+        this.tickInt   = null;
+        this.timerInt  = null;
+        this.lastTime  = Date.now();
+
+        // Core positions are static after init — only HP changes travel over wire
         this.cores = [
-            { id: 'core-0', team: 0, x: 200, y: MAP_HEIGHT / 2, hp: 2500, maxHp: 2500, radius: 40 }, // Red
-            { id: 'core-1', team: 1, x: MAP_WIDTH - 200, y: MAP_HEIGHT / 2, hp: 2500, maxHp: 2500, radius: 40 } // Blue
+            { id: 0, team: 0, x: 200,         y: MAP_H/2, hp: 2500, maxHp: 2500, r: 40 },
+            { id: 1, team: 1, x: MAP_W - 200, y: MAP_H/2, hp: 2500, maxHp: 2500, r: 40 },
         ];
-        
-        this.lastTime = Date.now();
     }
 
+    // ── Player management ──────────────────────────────────────────────────
     addPlayer(ws, id, name) {
-        // Assign to the team with fewer players, default to Red (0)
-        let redCount = 0, blueCount = 0;
-        for (let p of this.players.values()) p.team === 0 ? redCount++ : blueCount++;
-        const team = redCount <= blueCount ? 0 : 1;
+        // Balance teams
+        let red = 0, blue = 0;
+        for (const p of this.players.values()) p.team === 0 ? red++ : blue++;
+        const team   = red <= blue ? 0 : 1;
+        const startX = team === 0 ? 300 : MAP_W - 300;
 
-        const startX = team === 0 ? 300 : MAP_WIDTH - 300;
-        
         this.players.set(id, {
             id, ws, name, team,
-            x: startX, y: MAP_HEIGHT / 2,
-            radius: 15, speed: 250, // px per second
+            x: startX, y: MAP_H / 2,
+            r: 15, spd: 250,
             hp: 100, maxHp: 100,
-            angle: 0,
-            input: { dx: 0, dy: 0, shooting: false },
+            a: 0,                           // aim angle
+            inp: { dx: 0, dy: 0, sh: false },
             lastShot: 0,
-            respawnTimer: 0,
-            resources: 100 // Starting build points
+            rt: 0,                          // respawn timer
+            res: 100,                       // resources / scrap
         });
 
-        // Start game automatically when at least 2 players are in the lobby
-        if (this.state === PHASES.LOBBY && this.players.size >= 2) {
+        // Send init to THIS player only:
+        //  • their id, team, start pos
+        //  • static map dimensions
+        //  • full building list (for late-joiners)
+        //  • static core geometry (positions never change)
+        ws.send(JSON.stringify({
+            t    : 'init',
+            id,
+            r    : this.id,
+            mw   : MAP_W, mh: MAP_H,
+            team,
+            x    : startX, y: MAP_H / 2,
+            blds : Array.from(this.buildings.values()).map(wireBuild),
+            cores: this.cores.map(c => ({ id: c.id, tm: c.team, x: c.x, y: c.y, r: c.r, mhp: c.maxHp })),
+        }));
+
+        // Auto-start when ≥ 2 players
+        if (this.phase === PH.LOBBY && this.players.size >= 2) {
             this.startGame();
+        } else {
+            this.broadcastSnapshot(); // Sends current phase/players to everyone
         }
     }
 
     removePlayer(id) {
         this.players.delete(id);
-        if (this.players.size === 0) {
-            clearInterval(this.tickInterval);
-            rooms.delete(this.id);
-        }
+        if (this.players.size === 0) this.cleanup();
     }
 
-    startGame() {
-        this.state = PHASES.BUILD;
-        this.timer = BUILD_TIME;
-        this.cores.forEach(c => c.hp = c.maxHp);
-        this.buildings = [];
-        this.projectiles = [];
+    cleanup() {
+        clearInterval(this.tickInt);
+        clearInterval(this.timerInt);
+        rooms.delete(this.id);
+    }
 
-        // Distribute starting resources
-        for (let p of this.players.values()) {
-            p.resources = 150; 
-            p.hp = p.maxHp;
-            p.x = p.team === 0 ? 300 : MAP_WIDTH - 300;
-            p.y = MAP_HEIGHT / 2;
+    // ── Game flow ──────────────────────────────────────────────────────────
+    startGame() {
+        this.phase   = PH.BUILD;
+        this.timer   = BUILD_TIME;
+        this.winner  = -1;
+        this.events  = [];
+
+        this.cores.forEach(c => { c.hp = c.maxHp; });
+        this.buildings.clear();
+        this.projs.clear();
+
+        for (const p of this.players.values()) {
+            p.res = 150;
+            p.hp  = p.maxHp;
+            p.rt  = 0;
+            p.x   = p.team === 0 ? 300 : MAP_W - 300;
+            p.y   = MAP_H / 2;
         }
 
-        // Timer decrement interval
-        const timerInt = setInterval(() => {
-            if (this.players.size === 0) {
-                clearInterval(timerInt);
-                return;
-            }
-            if (this.state === PHASES.BUILD) {
+        // Broadcast a lightweight "start" burst so clients reset immediately
+        this.broadcastRaw(JSON.stringify({
+            t    : 'start',
+            ph   : this.phase,
+            tm   : this.timer,
+            cHps : [this.cores[0].hp, this.cores[1].hp],
+        }));
+
+        // 1-second countdown
+        this.timerInt = setInterval(() => {
+            if (this.players.size === 0) return;
+            if (this.phase === PH.BUILD) {
                 this.timer--;
                 if (this.timer <= 0) {
-                    this.state = PHASES.ATTACK;
-                    this.timer = 0; // Infinite
+                    this.phase = PH.ATTACK;
+                    this.timer = 0;
+                    this.events.push({ e: EV.PHASE_CHANGE, ph: PH.ATTACK });
                 }
             }
         }, 1000);
 
-        this.tickInterval = setInterval(() => this.tick(), 1000 / TICK_RATE);
+        this.tickInt = setInterval(() => this.tick(), 1000 / TICK_RATE);
     }
 
+    // ── Main tick (30 Hz) ──────────────────────────────────────────────────
     tick() {
         const now = Date.now();
-        const dt = (now - this.lastTime) / 1000;
+        const dt  = Math.min((now - this.lastTime) / 1000, 0.1); // cap at 100 ms
         this.lastTime = now;
+        this.tickCount++;
 
-        if (this.state === PHASES.END) return;
+        if (this.phase === PH.END) return;
 
-        // Process Player Movement & Shooting
-        for (let player of this.players.values()) {
-            if (player.respawnTimer > 0) {
-                player.respawnTimer -= dt;
-                if (player.respawnTimer <= 0) {
+        // ── Players ────────────────────────────────────────────────────────
+        for (const player of this.players.values()) {
+            if (player.rt > 0) {
+                player.rt -= dt;
+                if (player.rt <= 0) {
+                    player.rt = 0;
                     player.hp = player.maxHp;
-                    player.x = player.team === 0 ? 300 : MAP_WIDTH - 300;
-                    player.y = MAP_HEIGHT / 2;
+                    player.x  = player.team === 0 ? 300 : MAP_W - 300;
+                    player.y  = MAP_H / 2;
+                    this.events.push({
+                        e: EV.PLAYER_SPAWN,
+                        i: player.id,
+                        x: Math.round(player.x),
+                        y: Math.round(player.y),
+                        hp: player.hp,
+                    });
                 }
-                continue; // Dead players don't move or shoot
+                continue; // dead players skip movement & shooting
             }
 
-            // Move
-            let nx = player.x + (player.input.dx * player.speed * dt);
-            let ny = player.y + (player.input.dy * player.speed * dt);
-            
-            // Map boundaries
-            const midPoint = MAP_WIDTH / 2;
-            let minX = player.radius;
-            let maxX = MAP_WIDTH - player.radius;
-            
-            // Build phase restriction (can't cross middle)
-            if (this.state === PHASES.BUILD) {
-                if (player.team === 0) maxX = midPoint - player.radius;
-                if (player.team === 1) minX = midPoint + player.radius;
+            // Movement
+            let nx = player.x + player.inp.dx * player.spd * dt;
+            let ny = player.y + player.inp.dy * player.spd * dt;
+
+            const mid  = MAP_W / 2;
+            let minX   = player.r;
+            let maxX   = MAP_W - player.r;
+            if (this.phase === PH.BUILD) {
+                if (player.team === 0) maxX = mid - player.r;
+                else                   minX = mid + player.r;
             }
 
-            nx = Math.max(minX, Math.min(maxX, nx));
-            ny = Math.max(player.radius, Math.min(MAP_HEIGHT - player.radius, ny));
+            nx = clamp(nx, minX, maxX);
+            ny = clamp(ny, player.r, MAP_H - player.r);
 
-            // Basic Wall Collision (slide)
-            for (let b of this.buildings) {
-                if (b.type === 'wall') {
-                    // Simple AABB vs Circle
-                    if (this.circleRectCollide(nx, player.y, player.radius, b.x - b.w/2, b.y - b.h/2, b.w, b.h)) nx = player.x; // Block X
-                    if (this.circleRectCollide(player.x, ny, player.radius, b.x - b.w/2, b.y - b.h/2, b.w, b.h)) ny = player.y; // Block Y
+            // Wall collision (AABB vs circle, slide)
+            for (const b of this.buildings.values()) {
+                if (b.type === 'w') {
+                    const rx = b.x - 25, ry = b.y - 25;
+                    if (circleRect(nx, player.y, player.r, rx, ry, 50, 50)) nx = player.x;
+                    if (circleRect(player.x, ny, player.r, rx, ry, 50, 50)) ny = player.y;
                 }
             }
 
             player.x = nx;
             player.y = ny;
 
-            // Shoot
-            if (this.state === PHASES.ATTACK && player.input.shooting && now - player.lastShot > 200) { // 5 shots/sec
-                this.spawnProjectile(player.x, player.y, player.angle, player.team, player.id, false);
+            // Shooting
+            if (this.phase === PH.ATTACK && player.inp.sh && now - player.lastShot > 200) {
                 player.lastShot = now;
+                this.spawnProjectile(player.x, player.y, player.a, player.team, player.id, false);
             }
         }
 
-        // Process Turrets
-        if (this.state === PHASES.ATTACK) {
-            for (let b of this.buildings) {
-                if (b.type === 'turret') {
-                    if (now - (b.lastShot || 0) > 800) { // Turret fire rate
-                        let target = this.findClosestEnemy(b.x, b.y, b.team, 400); // range 400
-                        if (target) {
-                            let angle = Math.atan2(target.y - b.y, target.x - b.x);
-                            this.spawnProjectile(b.x, b.y, angle, b.team, 'turret', true);
-                            b.lastShot = now;
-                            b.angle = angle;
-                        }
+        // ── Turrets (attack phase only) ────────────────────────────────────
+        if (this.phase === PH.ATTACK) {
+            for (const b of this.buildings.values()) {
+                if (b.type === 't' && now - (b.ls || 0) > 800) {
+                    const target = this.findClosestEnemy(b.x, b.y, b.team, 400);
+                    if (target) {
+                        b.a  = Math.atan2(target.y - b.y, target.x - b.x);
+                        b.ls = now;
+                        this.spawnProjectile(b.x, b.y, b.a, b.team, b.id, true);
                     }
                 }
             }
         }
 
-        // Process Projectiles
-        for (let i = this.projectiles.length - 1; i >= 0; i--) {
-            let p = this.projectiles[i];
-            p.x += Math.cos(p.angle) * p.speed * dt;
-            p.y += Math.sin(p.angle) * p.speed * dt;
+        // ── Projectiles ───────────────────────────────────────────────────
+        for (const [pid, p] of this.projs) {
+            p.x += Math.cos(p.a) * p.spd * dt;
+            p.y += Math.sin(p.a) * p.spd * dt;
             p.life -= dt;
 
-            let destroyed = false;
+            let dead = p.life <= 0 || p.x < 0 || p.x > MAP_W || p.y < 0 || p.y > MAP_H;
 
-            // Bounds check
-            if (p.life <= 0 || p.x < 0 || p.x > MAP_WIDTH || p.y < 0 || p.y > MAP_HEIGHT) {
-                destroyed = true;
-            }
-
-            // Collisions only in Attack Phase (for gameplay) or just general
-            if (!destroyed && this.state === PHASES.ATTACK) {
-                // Players
-                for (let target of this.players.values()) {
-                    if (target.respawnTimer <= 0 && target.team !== p.team && this.dist(p.x, p.y, target.x, target.y) < target.radius + p.radius) {
-                        target.hp -= p.damage;
-                        if (target.hp <= 0) target.respawnTimer = 5; // 5 sec respawn
-                        destroyed = true;
-                        break;
-                    }
-                }
-
-                // Buildings
-                if (!destroyed) {
-                    for (let j = this.buildings.length - 1; j >= 0; j--) {
-                        let b = this.buildings[j];
-                        if (b.team !== p.team) {
-                            let hit = false;
-                            if (b.type === 'wall' && this.circleRectCollide(p.x, p.y, p.radius, b.x - b.w/2, b.y - b.h/2, b.w, b.h)) hit = true;
-                            if (b.type === 'turret' && this.dist(p.x, p.y, b.x, b.y) < b.radius + p.radius) hit = true;
-                            
-                            if (hit) {
-                                b.hp -= p.damage;
-                                if (b.hp <= 0) this.buildings.splice(j, 1);
-                                destroyed = true;
-                                break;
-                            }
+            if (!dead && this.phase === PH.ATTACK) {
+                // vs players
+                for (const target of this.players.values()) {
+                    if (dead) break;
+                    if (target.rt > 0 || target.team === p.team) continue;
+                    if (dist(p.x, p.y, target.x, target.y) < target.r + p.r) {
+                        target.hp -= p.dmg;
+                        dead = true;
+                        if (target.hp <= 0) {
+                            target.hp = 0;
+                            target.rt = 5;
+                            this.events.push({ e: EV.PLAYER_DIE, i: target.id });
+                        } else {
+                            this.events.push({ e: EV.PLAYER_HIT, i: target.id, hp: target.hp });
                         }
                     }
                 }
 
-                // Cores
-                if (!destroyed) {
-                    for (let c of this.cores) {
-                        if (c.team !== p.team && this.dist(p.x, p.y, c.x, c.y) < c.radius + p.radius) {
-                            c.hp -= p.damage;
-                            if (c.hp <= 0) {
-                                this.state = PHASES.END;
-                                this.winner = p.team;
+                // vs buildings
+                if (!dead) {
+                    for (const [bid, b] of this.buildings) {
+                        if (b.team === p.team) continue;
+                        const hit =
+                            (b.type === 'w' && circleRect(p.x, p.y, p.r, b.x-25, b.y-25, 50, 50)) ||
+                            (b.type === 't' && dist(p.x, p.y, b.x, b.y) < b.r + p.r);
+                        if (hit) {
+                            b.hp -= p.dmg;
+                            dead   = true;
+                            if (b.hp <= 0) {
+                                this.buildings.delete(bid);
+                                this.events.push({ e: EV.BUILD_DESTROY, i: bid });
+                            } else {
+                                this.events.push({ e: EV.BUILD_HIT, i: bid, hp: b.hp });
                             }
-                            destroyed = true;
                             break;
                         }
                     }
                 }
+
+                // vs cores
+                if (!dead) {
+                    for (const c of this.cores) {
+                        if (c.team === p.team || dist(p.x, p.y, c.x, c.y) >= c.r + p.r) continue;
+                        c.hp  -= p.dmg;
+                        dead   = true;
+                        if (c.hp <= 0) {
+                            c.hp         = 0;
+                            this.phase   = PH.END;
+                            this.winner  = p.team;
+                            this.events.push({ e: EV.WIN, w: this.winner });
+                        } else {
+                            this.events.push({ e: EV.CORE_HIT, id: c.id, hp: c.hp });
+                        }
+                        break;
+                    }
+                }
             }
 
-            if (destroyed) {
-                this.projectiles.splice(i, 1);
+            if (dead) {
+                this.projs.delete(pid);
+                this.events.push({ e: EV.PROJ_DESTROY, i: pid });
             }
         }
 
-        this.broadcastState();
+        // ── Broadcast snapshot every 2nd tick (15 Hz) ─────────────────────
+        if (this.tickCount % SNAP_EVERY === 0) this.broadcastSnapshot();
     }
 
-    spawnProjectile(x, y, angle, team, ownerId, isTurret) {
-        this.projectiles.push({
-            x, y, angle, team, ownerId,
-            speed: isTurret ? 400 : 700,
-            radius: 5,
-            damage: isTurret ? 10 : 15,
-            life: 2.0 // seconds
+    // ── Spawn projectile + emit event ──────────────────────────────────────
+    spawnProjectile(x, y, a, team, ownerId, isTurret) {
+        const id  = shortId();
+        const spd = isTurret ? 400 : 700;
+        const dmg = isTurret ? 10  : 15;
+        this.projs.set(id, { x, y, a, team, ownerId, spd, r: 5, dmg, life: 2.0 });
+
+        // Client simulates motion from this seed — no per-tick position needed
+        this.events.push({
+            e  : EV.PROJ_SPAWN,
+            i  : id,
+            x  : Math.round(x),
+            y  : Math.round(y),
+            a  : +a.toFixed(4),
+            tm : team,
+            spd,
+            r  : 5,
         });
     }
 
     findClosestEnemy(x, y, team, maxRange) {
-        let closest = null;
-        let minDist = maxRange;
-        for (let p of this.players.values()) {
-            if (p.team !== team && p.respawnTimer <= 0) {
-                let d = this.dist(x, y, p.x, p.y);
-                if (d < minDist) {
-                    minDist = d;
-                    closest = p;
-                }
-            }
+        let closest = null, minD = maxRange;
+        for (const p of this.players.values()) {
+            if (p.team === team || p.rt > 0) continue;
+            const d = dist(x, y, p.x, p.y);
+            if (d < minD) { minD = d; closest = p; }
         }
         return closest;
     }
 
-    handleBuild(player, buildReq) {
-        if (this.state !== PHASES.BUILD) return;
-        
-        const cost = buildReq.type === 'wall' ? 10 : 30;
-        if (player.resources < cost) return;
+    // ── Build handler ──────────────────────────────────────────────────────
+    handleBuild(player, req) {
+        if (this.phase !== PH.BUILD) return;
 
-        // Ensure building on their own side
-        const isRedSide = buildReq.x < MAP_WIDTH / 2 - 50;
-        const isBlueSide = buildReq.x > MAP_WIDTH / 2 + 50;
-        
-        if ((player.team === 0 && !isRedSide) || (player.team === 1 && !isBlueSide)) return;
+        // req.bt: 'w' (wall) or 't' (turret)
+        const cost = req.bt === 'w' ? 10 : 30;
+        if (player.res < cost) return;
 
-        // Distancing from core
-        let core = this.cores[player.team];
-        if (this.dist(buildReq.x, buildReq.y, core.x, core.y) < 150) return; // Too close to core
+        const mid  = MAP_W / 2;
+        const onRed  = req.x < mid - 50;
+        const onBlue = req.x > mid + 50;
+        if ((player.team === 0 && !onRed) || (player.team === 1 && !onBlue)) return;
 
-        if (buildReq.type === 'wall') {
-            this.buildings.push({
-                id: crypto.randomUUID(), type: 'wall', team: player.team,
-                x: buildReq.x, y: buildReq.y, w: 50, h: 50, hp: 200, maxHp: 200
-            });
-        } else if (buildReq.type === 'turret') {
-            this.buildings.push({
-                id: crypto.randomUUID(), type: 'turret', team: player.team,
-                x: buildReq.x, y: buildReq.y, radius: 20, hp: 150, maxHp: 150, angle: 0
-            });
-        }
+        const core = this.cores[player.team];
+        if (dist(req.x, req.y, core.x, core.y) < 150) return;
 
-        player.resources -= cost;
+        const id = shortId();
+        let b;
+        if (req.bt === 'w') {
+            b = { id, type: 'w', team: player.team, x: req.x, y: req.y, hp: 200, maxHp: 200 };
+        } else if (req.bt === 't') {
+            b = { id, type: 't', team: player.team, x: req.x, y: req.y, r: 20, hp: 150, maxHp: 150, a: 0, ls: 0 };
+        } else return;
+
+        this.buildings.set(id, b);
+        player.res -= cost;
+
+        // Only ONE event needed — all clients update their local building map
+        this.events.push({ e: EV.BUILD_ADD, b: wireBuild(b) });
     }
 
-    dist(x1, y1, x2, y2) {
-        return Math.hypot(x2 - x1, y2 - y1);
-    }
-
-    circleRectCollide(cx, cy, cr, rx, ry, rw, rh) {
-        let testX = cx;
-        let testY = cy;
-        if (cx < rx) testX = rx; else if (cx > rx + rw) testX = rx + rw;
-        if (cy < ry) testY = ry; else if (cy > ry + rh) testY = ry + rh;
-        let distX = cx - testX;
-        let distY = cy - testY;
-        return (distX * distX) + (distY * distY) <= (cr * cr);
-    }
-
-    broadcastState() {
-        const state = {
-            type: 'gameState',
-            phase: this.state,
-            timer: this.timer,
-            winner: this.winner,
-            cores: this.cores,
-            players: Array.from(this.players.values()).map(p => ({
-                id: p.id, name: p.name, team: p.team, x: Math.round(p.x), y: Math.round(p.y),
-                hp: p.hp, maxHp: p.maxHp, angle: p.angle, respawnTimer: p.respawnTimer, resources: p.resources
+    // ── Snapshot broadcast (15 Hz) ─────────────────────────────────────────
+    // Contains: phase, timer, core HPs, all player positions + states, event queue
+    // Does NOT contain: buildings (event-driven), projectiles (event-driven)
+    broadcastSnapshot() {
+        const snap = {
+            t  : 's',
+            ph : this.phase,
+            tm : this.timer,
+            c  : [this.cores[0].hp, this.cores[1].hp], // just the two HPs
+            p  : Array.from(this.players.values()).map(pl => ({
+                i  : pl.id,
+                nm : pl.name,
+                tm : pl.team,
+                x  : Math.round(pl.x),
+                y  : Math.round(pl.y),
+                hp : pl.hp,
+                rt : +pl.rt.toFixed(1),
+                a  : +pl.a.toFixed(3),
+                res: pl.res,
             })),
-            buildings: this.buildings.map(b => ({...b, x: Math.round(b.x), y: Math.round(b.y)})),
-            projectiles: this.projectiles.map(p => ({
-                x: Math.round(p.x), y: Math.round(p.y), team: p.team, radius: p.radius
-            }))
+            ev : this.events.splice(0),  // drain queue
         };
-        
-        const payload = JSON.stringify(state);
-        for (let p of this.players.values()) {
-            if (p.ws.readyState === WebSocket.OPEN) {
-                p.ws.send(payload);
-            }
+
+        this.broadcastRaw(JSON.stringify(snap));
+    }
+
+    broadcastRaw(payload) {
+        for (const p of this.players.values()) {
+            if (p.ws.readyState === WebSocket.OPEN) p.ws.send(payload);
         }
     }
 }
 
+// ─── WebSocket server ─────────────────────────────────────────────────────────
 wss.on('connection', (ws) => {
     const id = crypto.randomUUID();
     clients.set(ws, { id, roomId: null });
 
-    ws.on('message', (message) => {
+    ws.on('message', (raw) => {
         try {
-            const data = JSON.parse(message);
-            const clientInfo = clients.get(ws);
-            let room = clientInfo.roomId ? rooms.get(clientInfo.roomId) : null;
+            const data = JSON.parse(raw);
+            const info = clients.get(ws);
+            const room = info.roomId ? rooms.get(info.roomId) : null;
 
-            if (data.type === 'join') {
-                const requestedRoomId = data.roomId || findMatchmakingRoom();
-                if (!rooms.has(requestedRoomId)) {
-                    rooms.set(requestedRoomId, new Room(requestedRoomId));
+            // ── join ──────────────────────────────────────────────────────
+            if (data.t === 'join') {
+                const roomId = data.r || findRoom();
+                if (!rooms.has(roomId)) rooms.set(roomId, new Room(roomId));
+                const r = rooms.get(roomId);
+                if (r.players.size >= MAX_PLAYERS) {
+                    ws.send(JSON.stringify({ t: 'err', msg: 'Room full' }));
+                    return;
                 }
-                room = rooms.get(requestedRoomId);
-                
-                clientInfo.roomId = requestedRoomId;
-                room.addPlayer(ws, id, data.name || 'Player');
-                
-                ws.send(JSON.stringify({ 
-                    type: 'init', 
-                    id, 
-                    roomId: requestedRoomId, 
-                    map: { w: MAP_WIDTH, h: MAP_HEIGHT } 
-                }));
+                info.roomId = roomId;
+                r.addPlayer(ws, id, data.n || 'Pilot');
 
-            } else if (data.type === 'input' && room) {
+            // ── input (compact: t:"i", dx, dy, a, sh) ────────────────────
+            } else if (data.t === 'i' && room) {
                 const player = room.players.get(id);
-                if (player) {
-                    player.input.dx = data.dx;
-                    player.input.dy = data.dy;
-                    player.angle = data.angle;
-                    player.input.shooting = data.shooting;
+                if (player && player.rt <= 0) {
+                    player.inp.dx = clamp(+(data.dx) || 0, -1, 1);
+                    player.inp.dy = clamp(+(data.dy) || 0, -1, 1);
+                    player.a      = +(data.a)  || 0;
+                    player.inp.sh = !!data.sh;
                 }
-            } else if (data.type === 'build' && room) {
+
+            // ── build (compact: t:"b", bt:"w"|"t", x, y) ─────────────────
+            } else if (data.t === 'b' && room) {
                 const player = room.players.get(id);
                 if (player) room.handleBuild(player, data);
             }
         } catch (e) {
-            console.error('Message error:', e);
+            console.error('WS message error:', e.message);
         }
     });
 
     ws.on('close', () => {
-        const clientInfo = clients.get(ws);
-        if (clientInfo && clientInfo.roomId) {
-            const room = rooms.get(clientInfo.roomId);
-            if (room) room.removePlayer(clientInfo.id);
+        const info = clients.get(ws);
+        if (info?.roomId) {
+            const room = rooms.get(info.roomId);
+            if (room) room.removePlayer(info.id);
         }
         clients.delete(ws);
     });
 });
 
-function findMatchmakingRoom() {
-    // Find an open room in LOBBY phase
-    for (let [id, room] of rooms.entries()) {
-        if (room.state === PHASES.LOBBY && room.players.size < 10) {
-            return id;
-        }
+// ─── Matchmaking — FIFO, no ranking ──────────────────────────────────────────
+function findRoom() {
+    for (const [id, r] of rooms) {
+        if (r.phase === PH.LOBBY && r.players.size < MAX_PLAYERS) return id;
     }
-    // Else return new ID
     return crypto.randomBytes(4).toString('hex');
 }
 
-// Bind to 0.0.0.0 so cloud environments can detect the open port
-server.listen(PORT, '0.0.0.0', () => {
-    console.log(`Server started on port ${PORT}`);
-});
+server.listen(PORT, '0.0.0.0', () => console.log(`Core Wars server on :${PORT}`));
