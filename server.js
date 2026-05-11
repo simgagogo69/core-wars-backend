@@ -62,9 +62,8 @@ class Room {
             resources: 100 // Starting build points
         });
 
-        // Start game automatically if 2 players are present (1 per team for testing)
-        if (this.state === PHASES.LOBBY && this.players.size >= 1) {
-            // For testing alone, it starts immediately. In real prod, you might wait for 2.
+        // Start game automatically when at least 2 players are in the lobby
+        if (this.state === PHASES.LOBBY && this.players.size >= 2) {
             this.startGame();
         }
     }
