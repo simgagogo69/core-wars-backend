@@ -9,7 +9,8 @@ const http = require('http');
 // Setup standard HTTP server and attach WebSocket server
 const server = http.createServer();
 const wss = new WebSocket.Server({ server });
-const PORT = 3000;
+// Use the environment's port if available, otherwise default to 3000
+const PORT = process.env.PORT || 3000;
 
 // Game Constants
 const TICK_RATE = 30; // 30 FPS server-side logic
@@ -412,6 +413,7 @@ function findMatchmakingRoom() {
     return crypto.randomBytes(4).toString('hex');
 }
 
-server.listen(PORT, () => {
+// Bind to 0.0.0.0 so cloud environments can detect the open port
+server.listen(PORT, '0.0.0.0', () => {
     console.log(`Server started on port ${PORT}`);
 });
