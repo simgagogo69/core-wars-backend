@@ -423,7 +423,7 @@ class Room {
                 y  : Math.round(pl.y),
                 hp : pl.hp,
                 rt : +pl.rt.toFixed(1),
-                a  : +pl.a.toFixed(3),
+                a  : +pl.a.toFixed(1),
                 res: pl.res,
             })),
             ev : this.events.splice(0),  // drain queue
