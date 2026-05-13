@@ -1,17 +1,28 @@
 // Core Wars - Optimized Server
 // npm install ws  →  node server.js
+// https://core-wars-backend.onrender.com
 //
 // Optimizations applied:
-//  • 30 Hz tick loop, 15 Hz snapshot broadcast (every 2nd tick)
+//  • 30 Hz tick loop, 10 Hz snapshot broadcast (every 3rd tick)
 //  • Compact JSON keys throughout (t, i, x, y, ph, tm, …)
 //  • Projectiles sent as spawn/destroy EVENTS only — client simulates motion
+//  • PROJ_DESTROY only emitted on actual hits; natural expiry handled client-side
 //  • Buildings sent as add/remove EVENTS only — not in every snapshot
 //  • Event queue flushed once per snapshot (never mid-tick)
 //  • Input-only from client (no position in client→server traffic)
-//  • Input sent only when changed (client-side delta guard)
+//  • Input sent only when changed (client-side delta guard, 0.12 rad threshold)
 //  • 8-player hard cap per room
 //  • Room deleted immediately when empty
 //  • dt capped to avoid spiral-of-death on lag spike
+//  • DELTA snapshots: only moved players included (position/angle change threshold)
+//  • Angle byte-compressed: float → uint8 (0–255)
+//  • Names sent via 'names' broadcast (not repeated each snapshot)
+//  • HP sent via events only (PLAYER_HIT, PLAYER_SPAWN, PLAYER_DIE)
+//  • Resources sent via RES_CHANGE event only (not each snapshot)
+//  • Respawn timer removed from snapshots — client predicts locally
+//  • Phase / timer / core HPs sent only when they change
+//  • Snapshot skipped entirely when nothing has changed
+//  • Empty ev array omitted from payload
 
 const WebSocket = require('ws');
 const crypto    = require('crypto');
@@ -22,17 +33,15 @@ const wss    = new WebSocket.Server({ server });
 const PORT   = process.env.PORT || 3000;
 
 // ─── Constants ───────────────────────────────────────────────────────────────
-const TICK_RATE   = 30;          // Hz — physics / logic
-const SNAP_EVERY  = 2;           // broadcast every Nth tick → 15 Hz
+const TICK_RATE   = 30;
+const SNAP_EVERY  = 3;           // 10 Hz snapshots
 const MAP_W       = 2000;
 const MAP_H       = 1200;
 const MAX_PLAYERS = 8;
-const BUILD_TIME  = 30;          // seconds
+const BUILD_TIME  = 30;
 
-// Phase IDs (keep numeric — cheaper JSON)
 const PH = { LOBBY: 0, BUILD: 1, ATTACK: 2, END: 3 };
 
-// Event type IDs (numeric = most compact in JSON)
 const EV = {
     PHASE_CHANGE : 0,
     PLAYER_HIT   : 1,
@@ -45,16 +54,19 @@ const EV = {
     BUILD_HIT    : 8,
     CORE_HIT     : 9,
     WIN          : 10,
+    NAMES        : 11,   // name/team list — sent on join/leave, not per-snapshot
+    RES_CHANGE   : 12,   // resource update
+    PLAYER_LEAVE : 13,   // player disconnected
 };
 
 // ─── Global state ────────────────────────────────────────────────────────────
-const rooms   = new Map(); // roomId → Room
-const clients = new Map(); // ws     → { id, roomId }
+const rooms   = new Map();
+const clients = new Map();
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
-const dist      = (x1,y1,x2,y2) => Math.hypot(x2-x1, y2-y1);
-const clamp     = (v,lo,hi)      => Math.max(lo, Math.min(hi, v));
-const shortId   = ()             => crypto.randomBytes(3).toString('hex'); // 6-char hex
+const dist    = (x1,y1,x2,y2) => Math.hypot(x2-x1, y2-y1);
+const clamp   = (v,lo,hi)     => Math.max(lo, Math.min(hi, v));
+const shortId = ()            => crypto.randomBytes(3).toString('hex');
 
 function circleRect(cx, cy, cr, rx, ry, rw, rh) {
     const tx = clamp(cx, rx, rx + rw);
@@ -62,9 +74,12 @@ function circleRect(cx, cy, cr, rx, ry, rw, rh) {
     return (cx-tx)**2 + (cy-ty)**2 <= cr*cr;
 }
 
-// Strip building to wire format
+// Encode angle (-π..π) as uint8 (0–255)
+function encodeAngle(a) {
+    return Math.floor(((a + Math.PI) / (Math.PI * 2)) * 256) & 0xFF;
+}
+
 function wireBuild(b) {
-    // Only fields the client needs; omit internals (ls, etc.)
     return { i: b.id, tp: b.type, tm: b.team, x: Math.round(b.x), y: Math.round(b.y),
              hp: b.hp, mhp: b.maxHp, r: b.r || 0 };
 }
@@ -73,30 +88,32 @@ function wireBuild(b) {
 class Room {
     constructor(id) {
         this.id        = id;
-        this.players   = new Map();   // playerId → player object
-        this.buildings = new Map();   // buildId  → building object
-        this.projs     = new Map();   // projId   → projectile object
+        this.players   = new Map();
+        this.buildings = new Map();
+        this.projs     = new Map();
 
         this.phase     = PH.LOBBY;
         this.timer     = 0;
         this.winner    = -1;
         this.tickCount = 0;
-        this.events    = [];          // flushed each snapshot
+        this.events    = [];
 
         this.tickInt   = null;
         this.timerInt  = null;
         this.lastTime  = Date.now();
 
-        // Core positions are static after init — only HP changes travel over wire
+        // Delta-snapshot state trackers
+        this._prevPhase   = -1;
+        this._prevTimer   = -1;
+        this._prevCoreHPs = [-1, -1];
+
         this.cores = [
             { id: 0, team: 0, x: 200,         y: MAP_H/2, hp: 2500, maxHp: 2500, r: 40 },
             { id: 1, team: 1, x: MAP_W - 200, y: MAP_H/2, hp: 2500, maxHp: 2500, r: 40 },
         ];
     }
 
-    // ── Player management ──────────────────────────────────────────────────
     addPlayer(ws, id, name) {
-        // Balance teams
         let red = 0, blue = 0;
         for (const p of this.players.values()) p.team === 0 ? red++ : blue++;
         const team   = red <= blue ? 0 : 1;
@@ -107,18 +124,14 @@ class Room {
             x: startX, y: MAP_H / 2,
             r: 15, spd: 250,
             hp: 100, maxHp: 100,
-            a: 0,                           // aim angle
+            a: 0,
             inp: { dx: 0, dy: 0, sh: false },
             lastShot: 0,
-            rt: 0,                          // respawn timer
-            res: 100,                       // resources / scrap
+            rt: 0,
+            res: 100,
+            _px: -1, _py: -1, _ab: -1,  // delta sentinels — force first inclusion
         });
 
-        // Send init to THIS player only:
-        //  • their id, team, start pos
-        //  • static map dimensions
-        //  • full building list (for late-joiners)
-        //  • static core geometry (positions never change)
         ws.send(JSON.stringify({
             t    : 'init',
             id,
@@ -130,17 +143,26 @@ class Room {
             cores: this.cores.map(c => ({ id: c.id, tm: c.team, x: c.x, y: c.y, r: c.r, mhp: c.maxHp })),
         }));
 
-        // Auto-start when ≥ 2 players
+        // Broadcast name list once — not repeated in snapshots
+        this.broadcastNames();
+
         if (this.phase === PH.LOBBY && this.players.size >= 2) {
             this.startGame();
         } else {
-            this.broadcastSnapshot(); // Sends current phase/players to everyone
+            this.broadcastSnapshot();
         }
     }
 
     removePlayer(id) {
+        if (this.players.size > 1) {
+            this.events.push({ e: EV.PLAYER_LEAVE, i: id });
+        }
         this.players.delete(id);
-        if (this.players.size === 0) this.cleanup();
+        if (this.players.size === 0) {
+            this.cleanup();
+        } else {
+            this.broadcastNames();
+        }
     }
 
     cleanup() {
@@ -149,7 +171,11 @@ class Room {
         rooms.delete(this.id);
     }
 
-    // ── Game flow ──────────────────────────────────────────────────────────
+    broadcastNames() {
+        const n = Array.from(this.players.values()).map(p => ({ i: p.id, nm: p.name, tm: p.team }));
+        this.broadcastRaw(JSON.stringify({ t: 'names', n }));
+    }
+
     startGame() {
         this.phase   = PH.BUILD;
         this.timer   = BUILD_TIME;
@@ -160,15 +186,19 @@ class Room {
         this.buildings.clear();
         this.projs.clear();
 
+        this._prevPhase   = -1;
+        this._prevTimer   = -1;
+        this._prevCoreHPs = [-1, -1];
+
         for (const p of this.players.values()) {
             p.res = 150;
             p.hp  = p.maxHp;
             p.rt  = 0;
             p.x   = p.team === 0 ? 300 : MAP_W - 300;
             p.y   = MAP_H / 2;
+            p._px = -1; p._py = -1; p._ab = -1;
         }
 
-        // Broadcast a lightweight "start" burst so clients reset immediately
         this.broadcastRaw(JSON.stringify({
             t    : 'start',
             ph   : this.phase,
@@ -176,7 +206,6 @@ class Room {
             cHps : [this.cores[0].hp, this.cores[1].hp],
         }));
 
-        // 1-second countdown
         this.timerInt = setInterval(() => {
             if (this.players.size === 0) return;
             if (this.phase === PH.BUILD) {
@@ -192,16 +221,14 @@ class Room {
         this.tickInt = setInterval(() => this.tick(), 1000 / TICK_RATE);
     }
 
-    // ── Main tick (30 Hz) ──────────────────────────────────────────────────
     tick() {
         const now = Date.now();
-        const dt  = Math.min((now - this.lastTime) / 1000, 0.1); // cap at 100 ms
+        const dt  = Math.min((now - this.lastTime) / 1000, 0.1);
         this.lastTime = now;
         this.tickCount++;
 
         if (this.phase === PH.END) return;
 
-        // ── Players ────────────────────────────────────────────────────────
         for (const player of this.players.values()) {
             if (player.rt > 0) {
                 player.rt -= dt;
@@ -218,16 +245,15 @@ class Room {
                         hp: player.hp,
                     });
                 }
-                continue; // dead players skip movement & shooting
+                continue;
             }
 
-            // Movement
             let nx = player.x + player.inp.dx * player.spd * dt;
             let ny = player.y + player.inp.dy * player.spd * dt;
 
-            const mid  = MAP_W / 2;
-            let minX   = player.r;
-            let maxX   = MAP_W - player.r;
+            const mid = MAP_W / 2;
+            let minX  = player.r;
+            let maxX  = MAP_W - player.r;
             if (this.phase === PH.BUILD) {
                 if (player.team === 0) maxX = mid - player.r;
                 else                   minX = mid + player.r;
@@ -236,7 +262,6 @@ class Room {
             nx = clamp(nx, minX, maxX);
             ny = clamp(ny, player.r, MAP_H - player.r);
 
-            // Wall collision (AABB vs circle, slide)
             for (const b of this.buildings.values()) {
                 if (b.type === 'w') {
                     const rx = b.x - 25, ry = b.y - 25;
@@ -248,14 +273,12 @@ class Room {
             player.x = nx;
             player.y = ny;
 
-            // Shooting
             if (this.phase === PH.ATTACK && player.inp.sh && now - player.lastShot > 200) {
                 player.lastShot = now;
                 this.spawnProjectile(player.x, player.y, player.a, player.team, player.id, false);
             }
         }
 
-        // ── Turrets (attack phase only) ────────────────────────────────────
         if (this.phase === PH.ATTACK) {
             for (const b of this.buildings.values()) {
                 if (b.type === 't' && now - (b.ls || 0) > 800) {
@@ -269,22 +292,21 @@ class Room {
             }
         }
 
-        // ── Projectiles ───────────────────────────────────────────────────
         for (const [pid, p] of this.projs) {
             p.x += Math.cos(p.a) * p.spd * dt;
             p.y += Math.sin(p.a) * p.spd * dt;
             p.life -= dt;
 
-            let dead = p.life <= 0 || p.x < 0 || p.x > MAP_W || p.y < 0 || p.y > MAP_H;
+            let dead         = p.life <= 0 || p.x < 0 || p.x > MAP_W || p.y < 0 || p.y > MAP_H;
+            let hitSomething = false;
 
             if (!dead && this.phase === PH.ATTACK) {
-                // vs players
                 for (const target of this.players.values()) {
                     if (dead) break;
                     if (target.rt > 0 || target.team === p.team) continue;
                     if (dist(p.x, p.y, target.x, target.y) < target.r + p.r) {
                         target.hp -= p.dmg;
-                        dead = true;
+                        dead = true; hitSomething = true;
                         if (target.hp <= 0) {
                             target.hp = 0;
                             target.rt = 5;
@@ -295,7 +317,6 @@ class Room {
                     }
                 }
 
-                // vs buildings
                 if (!dead) {
                     for (const [bid, b] of this.buildings) {
                         if (b.team === p.team) continue;
@@ -304,7 +325,7 @@ class Room {
                             (b.type === 't' && dist(p.x, p.y, b.x, b.y) < b.r + p.r);
                         if (hit) {
                             b.hp -= p.dmg;
-                            dead   = true;
+                            dead = true; hitSomething = true;
                             if (b.hp <= 0) {
                                 this.buildings.delete(bid);
                                 this.events.push({ e: EV.BUILD_DESTROY, i: bid });
@@ -316,16 +337,15 @@ class Room {
                     }
                 }
 
-                // vs cores
                 if (!dead) {
                     for (const c of this.cores) {
                         if (c.team === p.team || dist(p.x, p.y, c.x, c.y) >= c.r + p.r) continue;
                         c.hp  -= p.dmg;
-                        dead   = true;
+                        dead   = true; hitSomething = true;
                         if (c.hp <= 0) {
-                            c.hp         = 0;
-                            this.phase   = PH.END;
-                            this.winner  = p.team;
+                            c.hp        = 0;
+                            this.phase  = PH.END;
+                            this.winner = p.team;
                             this.events.push({ e: EV.WIN, w: this.winner });
                         } else {
                             this.events.push({ e: EV.CORE_HIT, id: c.id, hp: c.hp });
@@ -337,31 +357,29 @@ class Room {
 
             if (dead) {
                 this.projs.delete(pid);
-                this.events.push({ e: EV.PROJ_DESTROY, i: pid });
+                // Only emit PROJ_DESTROY on hits — natural timeout self-deleted by client
+                if (hitSomething) this.events.push({ e: EV.PROJ_DESTROY, i: pid });
             }
         }
 
-        // ── Broadcast snapshot every 2nd tick (15 Hz) ─────────────────────
         if (this.tickCount % SNAP_EVERY === 0) this.broadcastSnapshot();
     }
 
-    // ── Spawn projectile + emit event ──────────────────────────────────────
     spawnProjectile(x, y, a, team, ownerId, isTurret) {
         const id  = shortId();
         const spd = isTurret ? 400 : 700;
         const dmg = isTurret ? 10  : 15;
         this.projs.set(id, { x, y, a, team, ownerId, spd, r: 5, dmg, life: 2.0 });
 
-        // Client simulates motion from this seed — no per-tick position needed
         this.events.push({
-            e  : EV.PROJ_SPAWN,
-            i  : id,
-            x  : Math.round(x),
-            y  : Math.round(y),
-            a  : +a.toFixed(4),
-            tm : team,
+            e: EV.PROJ_SPAWN,
+            i: id,
+            x: Math.round(x),
+            y: Math.round(y),
+            a: +a.toFixed(4),
+            tm: team,
             spd,
-            r  : 5,
+            r: 5,
         });
     }
 
@@ -375,15 +393,13 @@ class Room {
         return closest;
     }
 
-    // ── Build handler ──────────────────────────────────────────────────────
     handleBuild(player, req) {
         if (this.phase !== PH.BUILD) return;
 
-        // req.bt: 'w' (wall) or 't' (turret)
         const cost = req.bt === 'w' ? 10 : 30;
         if (player.res < cost) return;
 
-        const mid  = MAP_W / 2;
+        const mid    = MAP_W / 2;
         const onRed  = req.x < mid - 50;
         const onBlue = req.x > mid + 50;
         if ((player.team === 0 && !onRed) || (player.team === 1 && !onBlue)) return;
@@ -402,32 +418,48 @@ class Room {
         this.buildings.set(id, b);
         player.res -= cost;
 
-        // Only ONE event needed — all clients update their local building map
         this.events.push({ e: EV.BUILD_ADD, b: wireBuild(b) });
+        this.events.push({ e: EV.RES_CHANGE, i: player.id, r: player.res });
     }
 
-    // ── Snapshot broadcast (15 Hz) ─────────────────────────────────────────
-    // Contains: phase, timer, core HPs, all player positions + states, event queue
-    // Does NOT contain: buildings (event-driven), projectiles (event-driven)
+    // Delta snapshot — only what changed since last broadcast
     broadcastSnapshot() {
-        const snap = {
-            t  : 's',
-            ph : this.phase,
-            tm : this.timer,
-            c  : [this.cores[0].hp, this.cores[1].hp], // just the two HPs
-            p  : Array.from(this.players.values()).map(pl => ({
-                i  : pl.id,
-                nm : pl.name,
-                tm : pl.team,
-                x  : Math.round(pl.x),
-                y  : Math.round(pl.y),
-                hp : pl.hp,
-                rt : +pl.rt.toFixed(1),
-                a  : +pl.a.toFixed(1),
-                res: pl.res,
-            })),
-            ev : this.events.splice(0),  // drain queue
-        };
+        const evs = this.events.splice(0);
+
+        // Delta: only alive players whose position/angle byte changed
+        const changed = [];
+        for (const pl of this.players.values()) {
+            if (pl.rt > 0) continue;
+            const rx = Math.round(pl.x);
+            const ry = Math.round(pl.y);
+            const ab = encodeAngle(pl.a);
+            if (rx !== pl._px || ry !== pl._py || ab !== pl._ab) {
+                pl._px = rx; pl._py = ry; pl._ab = ab;
+                changed.push({ i: pl.id, x: rx, y: ry, a: ab });
+            }
+        }
+
+        // Skip broadcast entirely if nothing changed
+        if (changed.length === 0 && evs.length === 0) return;
+
+        const snap = { t: 's' };
+
+        if (this.phase !== this._prevPhase) {
+            snap.ph = this.phase;
+            this._prevPhase = this.phase;
+        }
+        if (this.timer !== this._prevTimer) {
+            snap.tm = this.timer;
+            this._prevTimer = this.timer;
+        }
+        if (this.cores[0].hp !== this._prevCoreHPs[0] || this.cores[1].hp !== this._prevCoreHPs[1]) {
+            snap.c = [this.cores[0].hp, this.cores[1].hp];
+            this._prevCoreHPs[0] = this.cores[0].hp;
+            this._prevCoreHPs[1] = this.cores[1].hp;
+        }
+
+        if (changed.length) snap.p = changed;
+        if (evs.length)     snap.ev = evs;
 
         this.broadcastRaw(JSON.stringify(snap));
     }
@@ -450,7 +482,6 @@ wss.on('connection', (ws) => {
             const info = clients.get(ws);
             const room = info.roomId ? rooms.get(info.roomId) : null;
 
-            // ── join ──────────────────────────────────────────────────────
             if (data.t === 'join') {
                 const roomId = data.r || findRoom();
                 if (!rooms.has(roomId)) rooms.set(roomId, new Room(roomId));
@@ -462,7 +493,6 @@ wss.on('connection', (ws) => {
                 info.roomId = roomId;
                 r.addPlayer(ws, id, data.n || 'Pilot');
 
-            // ── input (compact: t:"i", dx, dy, a, sh) ────────────────────
             } else if (data.t === 'i' && room) {
                 const player = room.players.get(id);
                 if (player && player.rt <= 0) {
@@ -472,7 +502,6 @@ wss.on('connection', (ws) => {
                     player.inp.sh = !!data.sh;
                 }
 
-            // ── build (compact: t:"b", bt:"w"|"t", x, y) ─────────────────
             } else if (data.t === 'b' && room) {
                 const player = room.players.get(id);
                 if (player) room.handleBuild(player, data);
@@ -486,13 +515,12 @@ wss.on('connection', (ws) => {
         const info = clients.get(ws);
         if (info?.roomId) {
             const room = rooms.get(info.roomId);
-            if (room) room.removePlayer(info.id);
+            if (room) room.removePlayer(id);
         }
         clients.delete(ws);
     });
 });
 
-// ─── Matchmaking — FIFO, no ranking ──────────────────────────────────────────
 function findRoom() {
     for (const [id, r] of rooms) {
         if (r.phase === PH.LOBBY && r.players.size < MAX_PLAYERS) return id;
