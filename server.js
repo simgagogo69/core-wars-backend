@@ -43,20 +43,42 @@ const BUILD_TIME  = 30;
 const PH = { LOBBY: 0, BUILD: 1, ATTACK: 2, END: 3 };
 
 const EV = {
-    PHASE_CHANGE : 0,
-    PLAYER_HIT   : 1,
-    PLAYER_DIE   : 2,
-    PLAYER_SPAWN : 3,
-    PROJ_SPAWN   : 4,
-    PROJ_DESTROY : 5,
-    BUILD_ADD    : 6,
-    BUILD_DESTROY: 7,
-    BUILD_HIT    : 8,
-    CORE_HIT     : 9,
-    WIN          : 10,
-    NAMES        : 11,   // name/team list — sent on join/leave, not per-snapshot
-    RES_CHANGE   : 12,   // resource update
-    PLAYER_LEAVE : 13,   // player disconnected
+    PHASE_CHANGE   : 0,
+    PLAYER_HIT     : 1,
+    PLAYER_DIE     : 2,
+    PLAYER_SPAWN   : 3,
+    PROJ_SPAWN     : 4,
+    PROJ_DESTROY   : 5,
+    BUILD_ADD      : 6,
+    BUILD_DESTROY  : 7,
+    BUILD_HIT      : 8,
+    CORE_HIT       : 9,
+    WIN            : 10,
+    NAMES          : 11,   // name/team list — sent on join/leave, not per-snapshot
+    RES_CHANGE     : 12,   // resource update
+    PLAYER_LEAVE   : 13,   // player disconnected
+    TURRET_UPGRADE : 14,   // turret upgraded to new subtype
+};
+
+// ─── Turret upgrade tree ──────────────────────────────────────────────────────
+// fireRate: ms between shots | dmg: damage per shot | range: targeting radius
+// projSpd: projectile speed  | projR: projectile radius
+// slow: applies movement slow on hit | dual: fires two projectiles
+// splash: AoE radius on impact (0 = none) | bonusVsBldg: 1.5× vs buildings
+const TURRET_DEFS = {
+    't':       { fireRate: 800,  dmg: 10, range: 400, hp: 150, projSpd: 400, projR: 5  },
+    't_mk2':   { fireRate: 650,  dmg: 12, range: 500, hp: 175, projSpd: 420, projR: 5,  upgFrom: 't',      cost: 40 },
+    't_mk3':   { fireRate: 550,  dmg: 15, range: 520, hp: 280, projSpd: 440, projR: 5,  upgFrom: 't_mk2',  cost: 60 },
+    't_supp':  { fireRate: 300,  dmg: 5,  range: 350, hp: 120, projSpd: 480, projR: 4,  upgFrom: 't',      cost: 40, slow: true },
+    't_storm': { fireRate: 240,  dmg: 5,  range: 360, hp: 145, projSpd: 500, projR: 4,  upgFrom: 't_supp', cost: 60, slow: true, dual: true },
+    't_break': { fireRate: 1600, dmg: 40, range: 450, hp: 180, projSpd: 300, projR: 9,  upgFrom: 't',      cost: 50, splash: 60 },
+    't_siege': { fireRate: 1400, dmg: 50, range: 460, hp: 210, projSpd: 320, projR: 11, upgFrom: 't_break', cost: 70, splash: 85, bonusVsBldg: true },
+};
+const UPGRADE_PATHS = {
+    't':       ['t_mk2', 't_supp', 't_break'],
+    't_mk2':   ['t_mk3'],
+    't_supp':  ['t_storm'],
+    't_break': ['t_siege'],
 };
 
 // ─── Global state ────────────────────────────────────────────────────────────
@@ -80,7 +102,8 @@ function encodeAngle(a) {
 }
 
 function wireBuild(b) {
-    return { i: b.id, tp: b.type, tm: b.team, x: Math.round(b.x), y: Math.round(b.y),
+    return { i: b.id, tp: b.type, st: b.subtype || 't', tm: b.team,
+             x: Math.round(b.x), y: Math.round(b.y),
              hp: b.hp, mhp: b.maxHp, r: b.r || 0 };
 }
 
@@ -129,6 +152,7 @@ class Room {
             lastShot: 0,
             rt: 0,
             res: 100,
+            slowUntil: 0,
             _px: -1, _py: -1, _ab: -1,  // delta sentinels — force first inclusion
         });
 
@@ -248,8 +272,8 @@ class Room {
                 continue;
             }
 
-            let nx = player.x + player.inp.dx * player.spd * dt;
-            let ny = player.y + player.inp.dy * player.spd * dt;
+            let nx = player.x + player.inp.dx * player.spd * (player.slowUntil > now ? 0.4 : 1.0) * dt;
+            let ny = player.y + player.inp.dy * player.spd * (player.slowUntil > now ? 0.4 : 1.0) * dt;
 
             const mid = MAP_W / 2;
             let minX  = player.r;
@@ -275,19 +299,29 @@ class Room {
 
             if (this.phase === PH.ATTACK && player.inp.sh && now - player.lastShot > 200) {
                 player.lastShot = now;
-                this.spawnProjectile(player.x, player.y, player.a, player.team, player.id, false);
+                this.spawnProjectile(player.x, player.y, player.a, player.team, player.id,
+                    { spd: 700, dmg: 15, r: 5, life: 2.0, pt: 'pl' });
             }
         }
 
         if (this.phase === PH.ATTACK) {
             for (const b of this.buildings.values()) {
-                if (b.type === 't' && now - (b.ls || 0) > 800) {
-                    const target = this.findClosestEnemy(b.x, b.y, b.team, 400);
-                    if (target) {
-                        b.a  = Math.atan2(target.y - b.y, target.x - b.x);
-                        b.ls = now;
-                        this.spawnProjectile(b.x, b.y, b.a, b.team, b.id, true);
-                    }
+                if (b.type !== 't') continue;
+                const fireRate = b.fireRate || 800;
+                if (now - (b.ls || 0) <= fireRate) continue;
+                const range  = b.range  || 400;
+                const target = this.findClosestEnemy(b.x, b.y, b.team, range);
+                if (!target) continue;
+                b.a  = Math.atan2(target.y - b.y, target.x - b.x);
+                b.ls = now;
+                const opts = {
+                    spd: b.projSpd || 400, dmg: b.dmgVal || 10, r: b.projR || 5, life: 2.0,
+                    slow: b.slow || false, splash: b.splash || 0,
+                    bonusVsBldg: b.bonusVsBldg || false, pt: b.subtype || 't',
+                };
+                this.spawnProjectile(b.x, b.y, b.a, b.team, b.id, opts);
+                if (b.dual) {
+                    this.spawnProjectile(b.x, b.y, b.a + 0.16, b.team, b.id, opts);
                 }
             }
         }
@@ -307,6 +341,7 @@ class Room {
                     if (dist(p.x, p.y, target.x, target.y) < target.r + p.r) {
                         target.hp -= p.dmg;
                         dead = true; hitSomething = true;
+                        if (p.slow) target.slowUntil = now + 650;
                         if (target.hp <= 0) {
                             target.hp = 0;
                             target.rt = 5;
@@ -324,7 +359,8 @@ class Room {
                             (b.type === 'w' && circleRect(p.x, p.y, p.r, b.x-25, b.y-25, 50, 50)) ||
                             (b.type === 't' && dist(p.x, p.y, b.x, b.y) < b.r + p.r);
                         if (hit) {
-                            b.hp -= p.dmg;
+                            const dmg = p.bonusVsBldg ? Math.round(p.dmg * 1.5) : p.dmg;
+                            b.hp -= dmg;
                             dead = true; hitSomething = true;
                             if (b.hp <= 0) {
                                 this.buildings.delete(bid);
@@ -357,6 +393,10 @@ class Room {
 
             if (dead) {
                 this.projs.delete(pid);
+                // Apply splash on impact
+                if (hitSomething && p.splash > 0) {
+                    this.applySplash(p.x, p.y, p.splash, p.team, Math.round(p.dmg * 0.5));
+                }
                 // Only emit PROJ_DESTROY on hits — natural timeout self-deleted by client
                 if (hitSomething) this.events.push({ e: EV.PROJ_DESTROY, i: pid });
             }
@@ -365,21 +405,28 @@ class Room {
         if (this.tickCount % SNAP_EVERY === 0) this.broadcastSnapshot();
     }
 
-    spawnProjectile(x, y, a, team, ownerId, isTurret) {
+    spawnProjectile(x, y, a, team, ownerId, opts = {}) {
         const id  = shortId();
-        const spd = isTurret ? 400 : 700;
-        const dmg = isTurret ? 10  : 15;
-        this.projs.set(id, { x, y, a, team, ownerId, spd, r: 5, dmg, life: 2.0 });
-
+        const spd = opts.spd !== undefined ? opts.spd : 700;
+        const dmg = opts.dmg !== undefined ? opts.dmg : 15;
+        const r   = opts.r   !== undefined ? opts.r   : 5;
+        const life = opts.life || 2.0;
+        this.projs.set(id, {
+            x, y, a, team, ownerId, spd, r, dmg, life,
+            slow: opts.slow || false,
+            splash: opts.splash || 0,
+            bonusVsBldg: opts.bonusVsBldg || false,
+            pt: opts.pt || 't',
+        });
         this.events.push({
-            e: EV.PROJ_SPAWN,
-            i: id,
-            x: Math.round(x),
-            y: Math.round(y),
-            a: +a.toFixed(4),
-            tm: team,
-            spd,
-            r: 5,
+            e  : EV.PROJ_SPAWN,
+            i  : id,
+            x  : Math.round(x),
+            y  : Math.round(y),
+            a  : +a.toFixed(4),
+            tm : team,
+            spd, r,
+            pt : opts.pt || 't',
         });
     }
 
@@ -412,7 +459,15 @@ class Room {
         if (req.bt === 'w') {
             b = { id, type: 'w', team: player.team, x: req.x, y: req.y, hp: 200, maxHp: 200 };
         } else if (req.bt === 't') {
-            b = { id, type: 't', team: player.team, x: req.x, y: req.y, r: 20, hp: 150, maxHp: 150, a: 0, ls: 0 };
+            const def = TURRET_DEFS['t'];
+            b = {
+                id, type: 't', subtype: 't', team: player.team,
+                x: req.x, y: req.y, r: 20,
+                hp: def.hp, maxHp: def.hp, a: 0, ls: 0,
+                fireRate: def.fireRate, dmgVal: def.dmg, range: def.range,
+                projSpd: def.projSpd, projR: def.projR,
+                slow: false, dual: false, splash: 0, bonusVsBldg: false,
+            };
         } else return;
 
         this.buildings.set(id, b);
@@ -420,6 +475,75 @@ class Room {
 
         this.events.push({ e: EV.BUILD_ADD, b: wireBuild(b) });
         this.events.push({ e: EV.RES_CHANGE, i: player.id, r: player.res });
+    }
+
+    handleUpgrade(player, req) {
+        if (this.phase !== PH.BUILD && this.phase !== PH.ATTACK) return;
+        const b = this.buildings.get(req.id);
+        if (!b || b.type !== 't' || b.team !== player.team) return;
+
+        const def = TURRET_DEFS[req.to];
+        if (!def || def.upgFrom !== b.subtype) return;
+        if (player.res < def.cost) return;
+
+        player.res -= def.cost;
+        const hpRatio  = b.hp / b.maxHp;
+        b.subtype      = req.to;
+        b.maxHp        = def.hp;
+        b.hp           = Math.max(1, Math.round(def.hp * hpRatio));
+        b.fireRate     = def.fireRate;
+        b.dmgVal       = def.dmg;
+        b.range        = def.range;
+        b.projSpd      = def.projSpd;
+        b.projR        = def.projR;
+        b.slow         = def.slow        || false;
+        b.dual         = def.dual        || false;
+        b.splash       = def.splash      || 0;
+        b.bonusVsBldg  = def.bonusVsBldg || false;
+
+        this.events.push({ e: EV.TURRET_UPGRADE, i: b.id, st: b.subtype, hp: b.hp, mhp: b.maxHp });
+        this.events.push({ e: EV.RES_CHANGE, i: player.id, r: player.res });
+    }
+
+    applySplash(cx, cy, radius, attackingTeam, dmg) {
+        for (const target of this.players.values()) {
+            if (target.rt > 0 || target.team === attackingTeam) continue;
+            if (dist(cx, cy, target.x, target.y) >= radius + target.r) continue;
+            target.hp -= dmg;
+            if (target.hp <= 0) {
+                target.hp = 0; target.rt = 5;
+                this.events.push({ e: EV.PLAYER_DIE, i: target.id });
+            } else {
+                this.events.push({ e: EV.PLAYER_HIT, i: target.id, hp: target.hp });
+            }
+        }
+        const toDelete = [];
+        for (const [bid, b] of this.buildings) {
+            if (b.team === attackingTeam) continue;
+            const hit = b.type === 'w'
+                ? circleRect(cx, cy, radius, b.x - 25, b.y - 25, 50, 50)
+                : dist(cx, cy, b.x, b.y) < radius + (b.r || 18);
+            if (!hit) continue;
+            b.hp -= dmg;
+            if (b.hp <= 0) {
+                toDelete.push(bid);
+                this.events.push({ e: EV.BUILD_DESTROY, i: bid });
+            } else {
+                this.events.push({ e: EV.BUILD_HIT, i: bid, hp: b.hp });
+            }
+        }
+        for (const bid of toDelete) this.buildings.delete(bid);
+        for (const c of this.cores) {
+            if (c.team === attackingTeam) continue;
+            if (dist(cx, cy, c.x, c.y) >= radius + c.r) continue;
+            c.hp -= dmg;
+            if (c.hp <= 0) {
+                c.hp = 0; this.phase = PH.END; this.winner = attackingTeam;
+                this.events.push({ e: EV.WIN, w: this.winner });
+            } else {
+                this.events.push({ e: EV.CORE_HIT, id: c.id, hp: c.hp });
+            }
+        }
     }
 
     // Delta snapshot — only what changed since last broadcast
@@ -505,6 +629,10 @@ wss.on('connection', (ws) => {
             } else if (data.t === 'b' && room) {
                 const player = room.players.get(id);
                 if (player) room.handleBuild(player, data);
+
+            } else if (data.t === 'upg' && room) {
+                const player = room.players.get(id);
+                if (player) room.handleUpgrade(player, data);
             }
         } catch (e) {
             console.error('WS message error:', e.message);
