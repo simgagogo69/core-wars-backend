@@ -78,25 +78,38 @@ const TURRET_DEFS = {
     't_siege':  { fireRate: 1400, dmg: 50, range: 460, hp: 210, projSpd: 320, projR: 11, upgFrom: 't_break',  cost: 70, splash: 85, bonusVsBldg: true },
     // ── BGM Corp tree ─────────────────────────────────────────────────────────
     // Base BGM turret — Excavator Node → Heavy Crude Turret
-    'bgm_t':    { fireRate: 1400, dmg: 18, range: 380, hp: 280, projSpd: 280, projR: 7  },  // slow rotate, high HP, decent dmg
-    'bgm_exc':  { fireRate: 1100, dmg: 22, range: 350, hp: 420, projSpd: 260, projR: 8,  upgFrom: 'bgm_t',   cost: 50 },  // Excavator Node
-    'bgm_hc':   { fireRate: 900,  dmg: 28, range: 360, hp: 550, projSpd: 240, projR: 10, upgFrom: 'bgm_exc', cost: 65 },  // Heavy Crude Turret
-    // Tier-2 branches (all from bgm_hc)
-    'bgm_drill':{ fireRate: 180,  dmg: 8,  range: 300, hp: 480, projSpd: 0,   projR: 6,  upgFrom: 'bgm_hc',  cost: 75, drill: true },   // Drill Turret — continuous beam, armour shred
-    'bgm_rail': { fireRate: 3200, dmg: 90, range: 750, hp: 400, projSpd: 900, projR: 12, upgFrom: 'bgm_hc',  cost: 80, bonusVsBldg: true }, // Rail Driver — long range, slow reload, burst
-    'bgm_molt': { fireRate: 1200, dmg: 15, range: 340, hp: 380, projSpd: 220, projR: 14, upgFrom: 'bgm_hc',  cost: 70, splash: 80, burn: true }, // Molten Projector — area denial + burn
-    'bgm_qsn':  { fireRate: 2000, dmg: 0,  range: 280, hp: 500, projSpd: 0,   projR: 0,  upgFrom: 'bgm_hc',  cost: 60, shield: true },  // Quarry Shield Node — utility
+    'bgm_t':    { fireRate: 1100, dmg: 22, range: 360, hp: 380, projSpd: 260, projR: 8  },  // Excavator Node — base BGM turret
+    // Tier-1 branches (all directly from bgm_t)
+    'bgm_drill':{ fireRate: 180,  dmg: 8,  range: 300, hp: 480, projSpd: 0,   projR: 6,  upgFrom: 'bgm_t', cost: 75, drill: true },
+    'bgm_rail': { fireRate: 3200, dmg: 90, range: 750, hp: 400, projSpd: 900, projR: 12, upgFrom: 'bgm_t', cost: 80, bonusVsBldg: true },
+    'bgm_molt': { fireRate: 1200, dmg: 15, range: 340, hp: 380, projSpd: 220, projR: 14, upgFrom: 'bgm_t', cost: 70, splash: 80, burn: true },
+    'bgm_qsn':  { fireRate: 2000, dmg: 0,  range: 280, hp: 500, projSpd: 0,   projR: 0,  upgFrom: 'bgm_t', cost: 60, shield: true },
+    // ── EPA tree ──────────────────────────────────────────────────────────────
+    // Accurate, durable, expensive. Higher base stats, premium cost.
+    'epa_t':        { fireRate: 600,  dmg: 14, range: 480, hp: 220, projSpd: 520, projR: 5  },  // Aegis Platform — base
+    // Option 1: linear precision chain
+    'epa_mk2':      { fireRate: 480,  dmg: 17, range: 530, hp: 300, projSpd: 560, projR: 5,  upgFrom: 'epa_t',        cost: 55 },
+    'epa_mk3':      { fireRate: 380,  dmg: 21, range: 580, hp: 400, projSpd: 600, projR: 5,  upgFrom: 'epa_mk2',      cost: 75 },
+    // Option 2: fortress/intercept chain
+    'epa_fortress': { fireRate: 550,  dmg: 16, range: 460, hp: 380, projSpd: 540, projR: 6,  upgFrom: 'epa_t',        cost: 60, dual: true, intercept: 0.25 },
+    'epa_knox':     { fireRate: 450,  dmg: 20, range: 480, hp: 520, projSpd: 560, projR: 6,  upgFrom: 'epa_fortress',  cost: 80, dual: true, intercept: 0.45 },
+    // Option 3: dominion aura (buffs nearby EPA turrets)
+    'epa_dominion': { fireRate: 500,  dmg: 18, range: 500, hp: 280, projSpd: 540, projR: 5,  upgFrom: 'epa_t',        cost: 65, dominion: true },
+    // Option 4: citadel — very expensive, devastating
+    'epa_citadel':  { fireRate: 280,  dmg: 28, range: 560, hp: 460, projSpd: 580, projR: 6,  upgFrom: 'epa_t',        cost: 120, dual: true, intercept: 0.30, citadel: true },
 };
 const UPGRADE_PATHS = {
     // ROE
-    't':        ['t_mk2', 't_supp', 't_break'],
-    't_mk2':    ['t_mk3'],
-    't_supp':   ['t_storm'],
-    't_break':  ['t_siege'],
+    't':           ['t_mk2', 't_supp', 't_break'],
+    't_mk2':       ['t_mk3'],
+    't_supp':      ['t_storm'],
+    't_break':     ['t_siege'],
     // BGM
-    'bgm_t':    ['bgm_exc'],
-    'bgm_exc':  ['bgm_hc'],
-    'bgm_hc':   ['bgm_drill', 'bgm_rail', 'bgm_molt', 'bgm_qsn'],
+    'bgm_t':       ['bgm_drill', 'bgm_rail', 'bgm_molt', 'bgm_qsn'],
+    // EPA
+    'epa_t':       ['epa_mk2', 'epa_fortress', 'epa_dominion', 'epa_citadel'],
+    'epa_mk2':     ['epa_mk3'],
+    'epa_fortress':['epa_knox'],
 };
 
 // ─── Wall upgrade tree ────────────────────────────────────────────────────────
@@ -106,25 +119,39 @@ const UPGRADE_PATHS = {
 // anchor: massive HP, no special mechanics
 const WALL_DEFS = {
     // ── ROE walls ─────────────────────────────────────────────────────────────
-    'w':              { hp: 200, repairCost: 0 },
-    'w_reinforced':   { hp: 350, repairCost: 5,  upgFrom: 'w',    cost: 20, exploResist: 0.75 },
+    'w':                 { hp: 200, repairCost: 0 },
+    'w_reinforced':      { hp: 350, repairCost: 5,  upgFrom: 'w',                  cost: 20, exploResist: 0.75 },
     // ── BGM walls ─────────────────────────────────────────────────────────────
-    'bgm_w':          { hp: 280, repairCost: 0 },
-    'bgm_w_blast':    { hp: 420, repairCost: 5,  upgFrom: 'bgm_w', cost: 25, exploResist: 0.40, shockAbsorb: true },
-    'bgm_w_thermal':  { hp: 320, repairCost: 5,  upgFrom: 'bgm_w', cost: 25, exploResist: 0.85, thermal: true },
-    'bgm_w_anchor':   { hp: 800, repairCost: 8,  upgFrom: 'bgm_w', cost: 35, exploResist: 0.60 },
-    'bgm_w_conduit':  { hp: 300, repairCost: 5,  upgFrom: 'bgm_w', cost: 30, exploResist: 0.90, conduit: true },
+    'bgm_w':             { hp: 280, repairCost: 0 },
+    'bgm_w_blast':       { hp: 420, repairCost: 5,  upgFrom: 'bgm_w',              cost: 25, exploResist: 0.40, shockAbsorb: true },
+    'bgm_w_thermal':     { hp: 320, repairCost: 5,  upgFrom: 'bgm_w',              cost: 25, exploResist: 0.85, thermal: true },
+    'bgm_w_anchor':      { hp: 800, repairCost: 8,  upgFrom: 'bgm_w',              cost: 35, exploResist: 0.60 },
+    'bgm_w_conduit':     { hp: 300, repairCost: 5,  upgFrom: 'bgm_w',              cost: 30, exploResist: 0.90, conduit: true },
+    // ── EPA walls — single linear upgrade chain ───────────────────────────────
+    'epa_w':             { hp: 240, repairCost: 0 },
+    'epa_w_fort':        { hp: 380, repairCost: 5,  upgFrom: 'epa_w',              cost: 22, exploResist: 0.80 },
+    'epa_w_bulwark':     { hp: 460, repairCost: 5,  upgFrom: 'epa_w_fort',         cost: 35, exploResist: 0.75, regen: true },
+    'epa_w_guardian':    { hp: 520, repairCost: 5,  upgFrom: 'epa_w_bulwark',      cost: 45, exploResist: 0.55, intercept: 0.20 },
+    'epa_w_citadel':     { hp: 600, repairCost: 6,  upgFrom: 'epa_w_guardian',     cost: 55, exploResist: 0.40, intercept: 0.30, citadelAura: true },
+    'epa_w_bastion':     { hp: 900, repairCost: 8,  upgFrom: 'epa_w_citadel',      cost: 70, exploResist: 0.25, intercept: 0.40, citadelAura: true, damageShare: true },
 };
 const WALL_UPGRADE_PATHS = {
     // ROE
-    'w':              ['w_reinforced'],
-    'w_reinforced':   [],
+    'w':                ['w_reinforced'],
+    'w_reinforced':     [],
     // BGM
-    'bgm_w':          ['bgm_w_blast', 'bgm_w_thermal', 'bgm_w_anchor', 'bgm_w_conduit'],
-    'bgm_w_blast':    [],
-    'bgm_w_thermal':  [],
-    'bgm_w_anchor':   [],
-    'bgm_w_conduit':  [],
+    'bgm_w':            ['bgm_w_blast', 'bgm_w_thermal', 'bgm_w_anchor', 'bgm_w_conduit'],
+    'bgm_w_blast':      [],
+    'bgm_w_thermal':    [],
+    'bgm_w_anchor':     [],
+    'bgm_w_conduit':    [],
+    // EPA
+    'epa_w':            ['epa_w_fort'],
+    'epa_w_fort':       ['epa_w_bulwark'],
+    'epa_w_bulwark':    ['epa_w_guardian'],
+    'epa_w_guardian':   ['epa_w_citadel'],
+    'epa_w_citadel':    ['epa_w_bastion'],
+    'epa_w_bastion':    [],
 };
 
 // ─── Faction definitions ──────────────────────────────────────────────────────
@@ -133,7 +160,7 @@ const WALL_UPGRADE_PATHS = {
 const FACTIONS = {
     'roe': { wallCost: 8,  turretCost: 25, hasUpgrades: true,  baseTurret: 't',     baseWall: 'w'     },
     'bgm': { wallCost: 15, turretCost: 35, hasUpgrades: true,  baseTurret: 'bgm_t', baseWall: 'bgm_w' },
-    'epa': { wallCost: 12, turretCost: 28, hasUpgrades: false, baseTurret: 't',     baseWall: 'w'     },
+    'epa': { wallCost: 12, turretCost: 28, hasUpgrades: true,  baseTurret: 'epa_t',   baseWall: 'epa_w'  },
 };
 
 // ─── Global state ────────────────────────────────────────────────────────────
@@ -436,7 +463,7 @@ class Room {
                 // ── Quarry Shield Node: buff nearby friendly structures ────────
                 if (b.shield) {
                     const shieldRadius = b.range || 280;
-                    if (now - (b.ls || 0) > 2000) {  // pulse every 2s
+                    if (now - (b.ls || 0) > 2000) {
                         b.ls = now;
                         for (const nb of this.buildings.values()) {
                             if (nb.team !== b.team || nb.id === b.id) continue;
@@ -452,8 +479,39 @@ class Room {
                     continue;
                 }
 
+                // ── Dominion Battery: buff nearby EPA turrets (fire rate + dmg) ─
+                if (b.dominion) {
+                    const domRadius = b.range || 500;
+                    const epaSubtypes = new Set(['epa_t','epa_mk2','epa_mk3','epa_fortress','epa_knox','epa_dominion','epa_citadel']);
+                    if (now - (b.ls || 0) > 4000) {
+                        b.ls = now;
+                        for (const nb of this.buildings.values()) {
+                            if (nb.id === b.id || nb.team !== b.team) continue;
+                            if (!epaSubtypes.has(nb.subtype)) continue;
+                            if (dist(b.x, b.y, nb.x, nb.y) >= domRadius) continue;
+                            // Apply temporary buff: reduce fireRate by 15%, +2 dmg for 3s
+                            nb._domBuff = now + 3000;
+                        }
+                    }
+                }
+
+                // ── Intercept: chance to destroy incoming enemy projectiles ──────
+                if ((b.intercept || 0) > 0) {
+                    const intR = 140;
+                    for (const [pid, p] of this.projs) {
+                        if (p.team === b.team) continue;
+                        if (dist(b.x, b.y, p.x, p.y) < intR) {
+                            if (Math.random() < (b.intercept || 0)) {
+                                this.projs.delete(pid);
+                                this.events.push({ e: EV.PROJ_DESTROY, i: pid });
+                            }
+                        }
+                    }
+                }
+
                 const fireRate = b.fireRate || 800;
-                if (now - (b.ls || 0) <= fireRate) continue;
+                const buffedFireRate = (b._domBuff && b._domBuff > now) ? Math.round(fireRate * 0.85) : fireRate;
+                if (now - (b.ls || 0) <= buffedFireRate) continue;
                 const range  = b.range  || 400;
                 const target = this.findClosestEnemy(b.x, b.y, b.team, range);
                 if (!target) continue;
@@ -502,6 +560,26 @@ class Room {
                     burn: b.burn || false,
                     pt: b.subtype || 't',
                 };
+
+                // Citadel: shield pulse on self every 5s + fire at up to 3 targets
+                if (b.citadel) {
+                    if (!b._citadelPulse || now - b._citadelPulse > 5000) {
+                        b._citadelPulse = now;
+                        const healAmt = Math.min(b.maxHp - b.hp, 12);
+                        if (healAmt > 0) {
+                            b.hp += healAmt;
+                            this.events.push({ e: EV.BUILD_HIT, i: b.id, hp: b.hp });
+                        }
+                    }
+                    // Find up to 3 enemy targets
+                    const targets = this.findMultipleEnemies(b.x, b.y, b.team, b.range || 560, 3);
+                    for (const t of targets) {
+                        const ta = Math.atan2(t.y - b.y, t.x - b.x);
+                        this.spawnProjectile(b.x, b.y, ta, b.team, b.id, opts);
+                    }
+                    continue;
+                }
+
                 this.spawnProjectile(b.x, b.y, b.a, b.team, b.id, opts);
                 if (b.dual) {
                     this.spawnProjectile(b.x, b.y, b.a + 0.16, b.team, b.id, opts);
@@ -545,14 +623,35 @@ class Room {
                             (b.type === 't' && dist(p.x, p.y, b.x, b.y) < b.r + p.r);
                         if (hit) {
                             const dmg = p.bonusVsBldg ? Math.round(p.dmg * 1.5) : p.dmg;
-                            b.hp -= dmg;
+                            // Citadel buff: temporarily lower incoming damage by 15%
+                            const citBuff  = (b.citadelBuff && b._citadelBuff > now) ? 0.85 : 1.0;
+                            const finalDmg = Math.round(dmg * citBuff);
+                            b.hp -= finalDmg;
                             dead = true; hitSomething = true;
                             // Thermal wall: reflect partial damage back toward attacker
                             if (b.thermal && b.hp > 0) {
-                                const reflected = Math.round(dmg * 0.25);
+                                const reflected = Math.round(finalDmg * 0.25);
                                 const backAngle = Math.atan2(p.y - b.y, p.x - b.x);
                                 this.spawnProjectile(b.x, b.y, backAngle, b.team, b.id,
                                     { spd: 320, dmg: reflected, r: 5, life: 1.2, pt: 'bgm_w_thermal' });
+                            }
+                            // Bastion damage share: distribute 20% of damage to nearby EPA walls
+                            if (b.damageShare && finalDmg > 0) {
+                                const shareR   = 200;
+                                const shareDmg = Math.round(finalDmg * 0.20);
+                                if (shareDmg > 0) {
+                                    for (const [nbid, nb] of this.buildings) {
+                                        if (nbid === bid || nb.team !== b.team || nb.type !== 'w') continue;
+                                        if (dist(b.x, b.y, nb.x, nb.y) >= shareR) continue;
+                                        nb.hp -= shareDmg;
+                                        if (nb.hp <= 0) {
+                                            this.buildings.delete(nbid);
+                                            this.events.push({ e: EV.BUILD_DESTROY, i: nbid });
+                                        } else {
+                                            this.events.push({ e: EV.BUILD_HIT, i: nbid, hp: nb.hp });
+                                        }
+                                    }
+                                }
                             }
                             if (b.hp <= 0) {
                                 this.buildings.delete(bid);
@@ -620,7 +719,7 @@ class Room {
                 // Conduit Wall — pulses HP regen to nearby BGM structures
                 if (b.conduit) {
                     const conduitR = 200;
-                    const bgmSubtypes = new Set(['bgm_t','bgm_exc','bgm_hc','bgm_drill','bgm_rail','bgm_molt','bgm_qsn',
+                    const bgmSubtypes = new Set(['bgm_t','bgm_drill','bgm_rail','bgm_molt','bgm_qsn',
                                                  'bgm_w','bgm_w_blast','bgm_w_thermal','bgm_w_anchor','bgm_w_conduit']);
                     for (const nb of this.buildings.values()) {
                         if (nb.id === b.id || nb.team !== b.team) continue;
@@ -630,6 +729,46 @@ class Room {
                         if (heal > 0) {
                             nb.hp += heal;
                             this.events.push({ e: EV.BUILD_HIT, i: nb.id, hp: nb.hp });
+                        }
+                    }
+                }
+
+                // ── EPA wall mechanics ────────────────────────────────────────────
+                // Bulwark+ regen: slow self-repair
+                if (b.regen) {
+                    const heal = Math.min(b.maxHp - b.hp, 4);
+                    if (heal > 0) {
+                        b.hp += heal;
+                        this.events.push({ e: EV.BUILD_HIT, i: b.id, hp: b.hp });
+                    }
+                }
+
+                // Citadel/Bastion aura: buff nearby EPA walls' exploResist
+                if (b.citadelAura) {
+                    const auraR = 180;
+                    const epaWallSubs = new Set(['epa_w','epa_w_fort','epa_w_bulwark','epa_w_guardian','epa_w_citadel','epa_w_bastion']);
+                    for (const nb of this.buildings.values()) {
+                        if (nb.id === b.id || nb.team !== b.team) continue;
+                        if (!epaWallSubs.has(nb.subtype)) continue;
+                        if (dist(b.x, b.y, nb.x, nb.y) >= auraR) continue;
+                        // Mark as citadel-buffed for 4s (reduces effective exploResist)
+                        nb._citadelBuff = now + 4000;
+                    }
+                }
+            }
+        }
+
+        // ── EPA wall intercept: chance to destroy nearby enemy projectiles ──────
+        if (this.phase === PH.ATTACK) {
+            for (const b of this.buildings.values()) {
+                if (b.type !== 'w' || !b.intercept || b.team === undefined) continue;
+                const intR = 100;
+                for (const [pid, p] of this.projs) {
+                    if (p.team === b.team) continue;
+                    if (dist(b.x, b.y, p.x, p.y) < intR) {
+                        if (Math.random() < b.intercept) {
+                            this.projs.delete(pid);
+                            this.events.push({ e: EV.PROJ_DESTROY, i: pid });
                         }
                     }
                 }
@@ -676,7 +815,7 @@ class Room {
     }
 
     handleBuild(player, req) {
-        if (this.phase !== PH.BUILD) return;
+        if (this.phase !== PH.BUILD && this.phase !== PH.ATTACK) return;
 
         const faction = FACTIONS[this.teamFactions[player.team]] || FACTIONS['roe'];
         const cost = req.bt === 'w' ? faction.wallCost : faction.turretCost;
@@ -696,9 +835,13 @@ class Room {
             const baseSt = faction.baseWall || 'w';
             const wdef   = WALL_DEFS[baseSt];
             b = { id, type: 'w', subtype: baseSt, team: player.team, x: req.x, y: req.y,
-                  hp: wdef.hp, maxHp: wdef.hp, exploResist: 1.0,
+                  hp: wdef.hp, maxHp: wdef.hp, exploResist: wdef.exploResist || 1.0,
                   thermal: wdef.thermal || false,
-                  conduit: wdef.conduit || false };
+                  conduit: wdef.conduit || false,
+                  regen: wdef.regen || false,
+                  intercept: wdef.intercept || 0,
+                  citadelAura: wdef.citadelAura || false,
+                  damageShare: wdef.damageShare || false };
         } else if (req.bt === 't') {
             const baseSt = faction.baseTurret || 't';
             const def = TURRET_DEFS[baseSt];
@@ -710,6 +853,7 @@ class Room {
                 projSpd: def.projSpd, projR: def.projR,
                 slow: false, dual: false, splash: 0, bonusVsBldg: false,
                 drill: def.drill || false, burn: def.burn || false, shield: def.shield || false,
+                intercept: def.intercept || 0, dominion: def.dominion || false, citadel: def.citadel || false,
             };
         } else return;
 
@@ -732,11 +876,15 @@ class Room {
         const def = TURRET_DEFS[req.to];
         if (!def || def.upgFrom !== b.subtype) return;
 
-        // Cross-faction guard: BGM turrets can only follow BGM paths and vice-versa
-        const bgmTypes = new Set(['bgm_t','bgm_exc','bgm_hc','bgm_drill','bgm_rail','bgm_molt','bgm_qsn']);
+        // Cross-faction guard: each faction's turrets stay in their own tree
+        const bgmTypes = new Set(['bgm_t','bgm_drill','bgm_rail','bgm_molt','bgm_qsn']);
+        const epaTypes = new Set(['epa_t','epa_mk2','epa_mk3','epa_fortress','epa_knox','epa_dominion','epa_citadel']);
         const targetIsBgm = bgmTypes.has(req.to);
         const currentIsBgm = bgmTypes.has(b.subtype);
+        const targetIsEpa = epaTypes.has(req.to);
+        const currentIsEpa = epaTypes.has(b.subtype);
         if (targetIsBgm !== currentIsBgm) return;
+        if (targetIsEpa !== currentIsEpa) return;
 
         if (player.res < def.cost) return;
 
@@ -757,6 +905,9 @@ class Room {
         b.drill        = def.drill       || false;
         b.burn         = def.burn        || false;
         b.shield       = def.shield      || false;
+        b.intercept    = def.intercept   || 0;
+        b.dominion     = def.dominion    || false;
+        b.citadel      = def.citadel     || false;
 
         this.events.push({ e: EV.TURRET_UPGRADE, i: b.id, st: b.subtype, hp: b.hp, mhp: b.maxHp });
         this.events.push({ e: EV.RES_CHANGE, i: player.id, r: player.res });
@@ -773,23 +924,39 @@ class Room {
         const def = WALL_DEFS[req.to];
         if (!def || def.upgFrom !== b.subtype) return;
 
-        // Cross-faction guard: BGM walls can only follow BGM paths
+        // Cross-faction guard: BGM walls stay BGM, EPA walls stay EPA
         const bgmWalls = new Set(['bgm_w','bgm_w_blast','bgm_w_thermal','bgm_w_anchor','bgm_w_conduit']);
+        const epaWalls = new Set(['epa_w','epa_w_fort','epa_w_bulwark','epa_w_guardian','epa_w_citadel','epa_w_bastion']);
         if (bgmWalls.has(req.to) !== bgmWalls.has(b.subtype)) return;
+        if (epaWalls.has(req.to) !== epaWalls.has(b.subtype)) return;
 
         if (player.res < def.cost) return;
 
         player.res -= def.cost;
-        const hpRatio  = b.hp / b.maxHp;
-        b.subtype      = req.to;
-        b.maxHp        = def.hp;
-        b.hp           = Math.max(1, Math.round(def.hp * hpRatio));
-        b.exploResist  = def.exploResist !== undefined ? def.exploResist : 1.0;
-        b.thermal      = def.thermal  || false;
-        b.conduit      = def.conduit  || false;
+        const hpRatio    = b.hp / b.maxHp;
+        b.subtype        = req.to;
+        b.maxHp          = def.hp;
+        b.hp             = Math.max(1, Math.round(def.hp * hpRatio));
+        b.exploResist    = def.exploResist    !== undefined ? def.exploResist : 1.0;
+        b.thermal        = def.thermal        || false;
+        b.conduit        = def.conduit        || false;
+        b.regen          = def.regen          || false;
+        b.intercept      = def.intercept      || 0;
+        b.citadelAura    = def.citadelAura    || false;
+        b.damageShare    = def.damageShare    || false;
 
         this.events.push({ e: EV.WALL_UPGRADE, i: b.id, st: b.subtype, hp: b.hp, mhp: b.maxHp });
         this.events.push({ e: EV.RES_CHANGE, i: player.id, r: player.res });
+    }
+
+    findMultipleEnemies(x, y, team, maxRange, count = 3) {
+        const results = [];
+        for (const p of this.players.values()) {
+            if (p.rt > 0 || p.team === team) continue;
+            if (dist(x, y, p.x, p.y) <= maxRange) results.push(p);
+        }
+        results.sort((a, b) => dist(x, y, a.x, a.y) - dist(x, y, b.x, b.y));
+        return results.slice(0, count);
     }
 
     applySplash(cx, cy, radius, attackingTeam, dmg) {
