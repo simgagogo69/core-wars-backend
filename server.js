@@ -35,11 +35,55 @@ const PORT   = process.env.PORT || 3000;
 // ─── Constants ───────────────────────────────────────────────────────────────
 const TICK_RATE   = 30;
 const SNAP_EVERY  = 3;           // 10 Hz snapshots
-const MAP_W       = 2000;
-const MAP_H       = 1200;
+const MAP_W       = 3000;
+const MAP_H       = 1400;
 const MAX_PLAYERS = 8;
 const BUILD_TIME  = 30;
 const VOTE_TIME   = 20;   // seconds players have to vote on faction before build phase
+
+// ─── Map definitions ─────────────────────────────────────────────────────────
+// waterZones: array of {x,y,w,h} rectangles that are impassable water
+// cores:  [{x,y},{x,y}] — red then blue
+// spawns: [{x,y},{x,y}] — red then blue
+const MAP_DEFS = [
+    {
+        id  : 0,
+        name: 'WARZONE',
+        waterZones: [],
+        cores : [{ x: 200,         y: MAP_H / 2 }, { x: MAP_W - 200,  y: MAP_H / 2 }],
+        spawns: [{ x: 380,         y: MAP_H / 2 }, { x: MAP_W - 380,  y: MAP_H / 2 }],
+    },
+    {
+        id  : 1,
+        name: 'ARCHIPELAGO',
+        // Red island  x:0-800, y:200-1200
+        // Blue island x:2200-3000, y:200-1200
+        // Bridge      x:800-2200,  y:540-860
+        waterZones: [
+            { x: 0,    y: 0,    w: 800,  h: 200  },   // red island top corner
+            { x: 0,    y: 1200, w: 800,  h: 200  },   // red island bottom corner
+            { x: 2200, y: 0,    w: 800,  h: 200  },   // blue island top corner
+            { x: 2200, y: 1200, w: 800,  h: 200  },   // blue island bottom corner
+            { x: 800,  y: 0,    w: 1400, h: 540  },   // open sea top (above bridge)
+            { x: 800,  y: 860,  w: 1400, h: 540  },   // open sea bottom (below bridge)
+        ],
+        cores : [{ x: 250,  y: MAP_H / 2 }, { x: MAP_W - 250,  y: MAP_H / 2 }],
+        spawns: [{ x: 430,  y: MAP_H / 2 }, { x: MAP_W - 430,  y: MAP_H / 2 }],
+    },
+    {
+        id  : 2,
+        name: 'CHOKEPOINT',
+        // Red base  x:0-950,   full height
+        // Blue base x:2050-3000, full height
+        // Middle corridor x:950-2050, y:380-1020
+        waterZones: [
+            { x: 950, y: 0,    w: 1100, h: 380  },   // sea top-centre
+            { x: 950, y: 1020, w: 1100, h: 380  },   // sea bottom-centre
+        ],
+        cores : [{ x: 200,         y: MAP_H / 2 }, { x: MAP_W - 200,  y: MAP_H / 2 }],
+        spawns: [{ x: 380,         y: MAP_H / 2 }, { x: MAP_W - 380,  y: MAP_H / 2 }],
+    },
+];
 
 const PH = { LOBBY: 0, BUILD: 1, ATTACK: 2, END: 3 };
 
@@ -217,9 +261,12 @@ class Room {
         this.teamFactions = ['roe', 'roe'];                   // resolved faction per team
         this.voteStarted  = false;                            // prevents duplicate vote phase
 
+        // Pick a random map for this room
+        this.mapDef = MAP_DEFS[Math.floor(Math.random() * MAP_DEFS.length)];
+
         this.cores = [
-            { id: 0, team: 0, x: 200,         y: MAP_H/2, hp: 2500, maxHp: 2500, r: 40 },
-            { id: 1, team: 1, x: MAP_W - 200, y: MAP_H/2, hp: 2500, maxHp: 2500, r: 40 },
+            { id: 0, team: 0, x: this.mapDef.cores[0].x, y: this.mapDef.cores[0].y, hp: 2500, maxHp: 2500, r: 40 },
+            { id: 1, team: 1, x: this.mapDef.cores[1].x, y: this.mapDef.cores[1].y, hp: 2500, maxHp: 2500, r: 40 },
         ];
     }
 
@@ -266,11 +313,11 @@ class Room {
         let red = 0, blue = 0;
         for (const p of this.players.values()) p.team === 0 ? red++ : blue++;
         const team   = red <= blue ? 0 : 1;
-        const startX = team === 0 ? 300 : MAP_W - 300;
+        const spawn  = this.mapDef.spawns[team];
 
         this.players.set(id, {
             id, ws, name, team,
-            x: startX, y: MAP_H / 2,
+            x: spawn.x, y: spawn.y,
             r: 15, spd: 250,
             hp: 100, maxHp: 100,
             a: 0,
@@ -289,7 +336,11 @@ class Room {
             r    : this.id,
             mw   : MAP_W, mh: MAP_H,
             team,
-            x    : startX, y: MAP_H / 2,
+            x    : spawn.x, y: spawn.y,
+            mapId  : this.mapDef.id,
+            mapName: this.mapDef.name,
+            wz     : this.mapDef.waterZones,
+            spawns : this.mapDef.spawns,
             blds : Array.from(this.buildings.values()).map(wireBuild),
             cores: this.cores.map(c => ({ id: c.id, tm: c.team, x: c.x, y: c.y, r: c.r, mhp: c.maxHp })),
         }));
@@ -327,6 +378,15 @@ class Room {
         this.broadcastRaw(JSON.stringify({ t: 'names', n }));
     }
 
+    // Returns true if a circle at (x,y) with radius r overlaps any water zone
+    isOnWater(x, y, r = 0) {
+        for (const wz of this.mapDef.waterZones) {
+            if (x + r > wz.x && x - r < wz.x + wz.w &&
+                y + r > wz.y && y - r < wz.y + wz.h) return true;
+        }
+        return false;
+    }
+
     startGame() {
         // Resolve factions from votes before clearing them
         this.teamFactions[0] = this.resolveFaction(0);
@@ -353,8 +413,9 @@ class Room {
             p.rt  = 0;
             p.burnUntil = 0;
             p._lastBurnTick = 0;
-            p.x   = p.team === 0 ? 300 : MAP_W - 300;
-            p.y   = MAP_H / 2;
+            const spawn = this.mapDef.spawns[p.team];
+            p.x   = spawn.x;
+            p.y   = spawn.y;
             p._px = -1; p._py = -1; p._ab = -1;
         }
 
@@ -364,6 +425,10 @@ class Room {
             tm   : this.timer,
             cHps : [this.cores[0].hp, this.cores[1].hp],
             fcts : this.teamFactions,   // resolved factions — ['roe','bgm'] etc.
+            mapId  : this.mapDef.id,
+            mapName: this.mapDef.name,
+            wz     : this.mapDef.waterZones,
+            spawns : this.mapDef.spawns,
         }));
 
         this.timerInt = setInterval(() => {
@@ -397,8 +462,9 @@ class Room {
                     player.hp = player.maxHp;
                     player.burnUntil = 0;
                     player._lastBurnTick = 0;
-                    player.x  = player.team === 0 ? 300 : MAP_W - 300;
-                    player.y  = MAP_H / 2;
+                    const spawn = this.mapDef.spawns[player.team];
+                    player.x  = spawn.x;
+                    player.y  = spawn.y;
                     this.events.push({
                         e: EV.PLAYER_SPAWN,
                         i: player.id,
@@ -431,6 +497,10 @@ class Room {
                     if (circleRect(player.x, ny, player.r, rx, ry, 50, 50)) ny = player.y;
                 }
             }
+
+            // Water zone collision — push back if entering water
+            if (this.isOnWater(nx, player.y, player.r)) nx = player.x;
+            if (this.isOnWater(player.x, ny, player.r)) ny = player.y;
 
             player.x = nx;
             player.y = ny;
@@ -828,6 +898,9 @@ class Room {
 
         const core = this.cores[player.team];
         if (dist(req.x, req.y, core.x, core.y) < 150) return;
+
+        // Can't build on water
+        if (this.isOnWater(req.x, req.y, 25)) return;
 
         const id = shortId();
         let b;
