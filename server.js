@@ -619,6 +619,10 @@ class Room {
                     const rx = b.x - 25, ry = b.y - 25;
                     if (circleRect(nx, player.y, player.r, rx, ry, 50, 50)) nx = player.x;
                     if (circleRect(player.x, ny, player.r, rx, ry, 50, 50)) ny = player.y;
+                } else if (b.type === 't') {
+                    const tr = 18 + player.r;
+                    if (Math.hypot(nx - b.x, player.y - b.y) < tr) nx = player.x;
+                    if (Math.hypot(player.x - b.x, ny - b.y) < tr) ny = player.y;
                 }
             }
 
