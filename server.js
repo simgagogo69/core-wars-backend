@@ -39,7 +39,8 @@ const MAP_W       = 3000;
 const MAP_H       = 1400;
 const MAX_PLAYERS = 8;
 const BUILD_TIME  = 30;
-const VOTE_TIME   = 20;   // seconds players have to vote on faction before build phase
+const LOBBY_TIME  = 120;  // 2-min lobby countdown (when 2+ players, nobody voted yet)
+const VOTE_TIME   = 25;   // seconds for the dedicated voting phase
 
 // ─── Map definitions ─────────────────────────────────────────────────────────
 // waterZones: array of {x,y,w,h} rectangles that are impassable water
@@ -256,12 +257,19 @@ class Room {
         this._prevTimer   = -1;
         this._prevCoreHPs = [-1, -1];
 
-        // Faction voting state
-        this.factionVotes = { 0: new Map(), 1: new Map() };  // team → Map(playerId → factionId)
-        this.teamFactions = ['roe', 'roe'];                   // resolved faction per team
-        this.voteStarted  = false;                            // prevents duplicate vote phase
+        // Lobby ready / countdown state
+        this.readyStates    = new Map();  // playerId → true(ready) | false(not-ready)
+        this.lobbyCountdown = -1;         // -1 = infinite (paused)
+        this.lobbyRunning   = false;
+        this.lobbyTimerInt  = null;
+        this.inVotePhase    = false;
 
-        // Pick a random map for this room
+        // Faction voting (per team) + map voting (global)
+        this.factionVotes = { 0: new Map(), 1: new Map() };
+        this.teamFactions = ['roe', 'roe'];
+        this.mapVotes     = new Map();  // playerId → mapId (number)
+
+        // Pick a random map now as placeholder — will be resolved by vote at game start
         this.mapDef = MAP_DEFS[Math.floor(Math.random() * MAP_DEFS.length)];
 
         this.cores = [
@@ -270,42 +278,141 @@ class Room {
         ];
     }
 
+    // ── Lobby countdown management ────────────────────────────────────────────
+    startLobbyCountdown(seconds) {
+        if (this.lobbyTimerInt) clearInterval(this.lobbyTimerInt);
+        this.lobbyCountdown = seconds;
+        this.lobbyRunning   = true;
+        this.lobbyTimerInt  = setInterval(() => {
+            if (this.players.size === 0) { clearInterval(this.lobbyTimerInt); return; }
+            this.lobbyCountdown = Math.max(0, this.lobbyCountdown - 1);
+            this.broadcastLobbyState();
+            if (this.lobbyCountdown <= 0) {
+                clearInterval(this.lobbyTimerInt);
+                this.lobbyTimerInt = null;
+                this.startVotePhase();
+            }
+        }, 1000);
+    }
+
+    pauseLobbyCountdown() {
+        if (this.lobbyTimerInt) { clearInterval(this.lobbyTimerInt); this.lobbyTimerInt = null; }
+        this.lobbyRunning   = false;
+        this.lobbyCountdown = -1;
+    }
+
+    // Re-evaluate lobby timer state based on ready votes
+    evaluateLobby() {
+        if (this.inVotePhase || this.phase !== PH.LOBBY) return;
+        const n = this.players.size;
+        if (n < 2) {
+            this.pauseLobbyCountdown();
+            this.broadcastLobbyState();
+            return;
+        }
+        const readyCount  = [...this.readyStates.values()].filter(v => v === true).length;
+        const notReadyAny = [...this.readyStates.values()].some(v => v === false);
+        const anyReady    = readyCount > 0;
+        const allReady    = readyCount === n;
+
+        if (allReady) {
+            if (this.lobbyTimerInt) clearInterval(this.lobbyTimerInt);
+            this.broadcastLobbyState();
+            this.startVotePhase();
+            return;
+        }
+
+        if (notReadyAny) {
+            // At least one explicit "not ready" → pause
+            this.pauseLobbyCountdown();
+        } else if (anyReady) {
+            // Someone ready, nobody explicitly not-ready → ≤ 30s
+            if (!this.lobbyRunning || this.lobbyCountdown > 30) {
+                this.startLobbyCountdown(Math.min(this.lobbyCountdown > 0 ? this.lobbyCountdown : 30, 30));
+            }
+        } else {
+            // Nobody has voted yet → start 2-min countdown if not already running
+            if (!this.lobbyRunning) {
+                this.startLobbyCountdown(LOBBY_TIME);
+            }
+        }
+        this.broadcastLobbyState();
+    }
+
+    broadcastLobbyState() {
+        const rd = [];
+        for (const [pid, r] of this.readyStates) rd.push({ i: pid, r });
+        this.broadcastRaw(JSON.stringify({
+            t  : 'lobbystate',
+            tm : this.lobbyRunning ? this.lobbyCountdown : -1,
+            rd,
+            n  : this.players.size,
+        }));
+    }
+
     // ── Faction voting ────────────────────────────────────────────────────────
     resolveFaction(team) {
         const votes = {};
-        for (const f of this.factionVotes[team].values()) {
-            votes[f] = (votes[f] || 0) + 1;
-        }
+        for (const f of this.factionVotes[team].values()) votes[f] = (votes[f] || 0) + 1;
         const entries = Object.entries(votes);
-        if (entries.length === 0) return 'roe';   // default if no votes
+        if (entries.length === 0) return 'roe';
         const maxVotes = Math.max(...entries.map(e => e[1]));
         const tied     = entries.filter(e => e[1] === maxVotes).map(e => e[0]);
-        return tied[Math.floor(Math.random() * tied.length)];  // random tiebreak
+        return tied[Math.floor(Math.random() * tied.length)];
     }
 
+    // Each player only sees their own team's faction tally
     broadcastFactionVotes() {
-        const tallies = [0, 1].map(team => {
-            const votes = {};
-            for (const f of this.factionVotes[team].values()) votes[f] = (votes[f] || 0) + 1;
-            return votes;
-        });
-        this.broadcastRaw(JSON.stringify({ t: 'fvotes', v: tallies }));
+        for (const p of this.players.values()) {
+            const tally = {};
+            for (const f of this.factionVotes[p.team].values()) tally[f] = (tally[f] || 0) + 1;
+            if (p.ws.readyState === WebSocket.OPEN)
+                p.ws.send(JSON.stringify({ t: 'fvotes', v: tally }));
+        }
+    }
+
+    // ── Map voting ────────────────────────────────────────────────────────────
+    resolveMap() {
+        const v = {};
+        for (const mapId of this.mapVotes.values()) v[mapId] = (v[mapId] || 0) + 1;
+        const entries = Object.entries(v);
+        if (entries.length === 0) return MAP_DEFS[Math.floor(Math.random() * MAP_DEFS.length)];
+        const maxV = Math.max(...entries.map(e => +e[1]));
+        const tied = entries.filter(e => +e[1] === maxV).map(e => +e[0]);
+        const winId = tied[Math.floor(Math.random() * tied.length)];
+        return MAP_DEFS.find(m => m.id === winId) || MAP_DEFS[0];
+    }
+
+    broadcastMapVotes() {
+        const v = {};
+        for (const mapId of this.mapVotes.values()) v[mapId] = (v[mapId] || 0) + 1;
+        this.broadcastRaw(JSON.stringify({ t: 'mvotes', v }));
     }
 
     startVotePhase() {
-        if (this.voteStarted) return;
-        this.voteStarted = true;
+        if (this.inVotePhase) return;
+        this.inVotePhase = true;
+        this.factionVotes = { 0: new Map(), 1: new Map() };
+        this.mapVotes     = new Map();
         let countdown = VOTE_TIME;
-        this.broadcastRaw(JSON.stringify({ t: 'votestart', tm: VOTE_TIME }));
 
-        const voteInterval = setInterval(() => {
-            if (this.players.size === 0) { clearInterval(voteInterval); return; }
+        // Send votestart individually so map list is included
+        for (const p of this.players.values()) {
+            if (p.ws.readyState === WebSocket.OPEN) {
+                p.ws.send(JSON.stringify({
+                    t    : 'votestart',
+                    tm   : VOTE_TIME,
+                    maps : MAP_DEFS.map(m => ({ id: m.id, name: m.name })),
+                    team : p.team,
+                }));
+            }
+        }
+
+        const vi = setInterval(() => {
+            if (this.players.size === 0) { clearInterval(vi); return; }
             countdown--;
             this.broadcastRaw(JSON.stringify({ t: 'votetick', tm: countdown }));
-            if (countdown <= 0) {
-                clearInterval(voteInterval);
-                this.startGame();
-            }
+            if (countdown <= 0) { clearInterval(vi); this.startGame(); }
         }, 1000);
     }
 
@@ -348,11 +455,8 @@ class Room {
         // Broadcast name list once — not repeated in snapshots
         this.broadcastNames();
 
-        if (this.phase === PH.LOBBY && this.players.size >= 2) {
-            this.startVotePhase();
-        } else {
-            this.broadcastSnapshot();
-        }
+        // Evaluate lobby countdown state with the new player count
+        this.evaluateLobby();
     }
 
     removePlayer(id) {
@@ -360,21 +464,30 @@ class Room {
             this.events.push({ e: EV.PLAYER_LEAVE, i: id });
         }
         this.players.delete(id);
+        this.readyStates.delete(id);
+        this.mapVotes.delete(id);
         if (this.players.size === 0) {
             this.cleanup();
         } else {
             this.broadcastNames();
+            this.evaluateLobby();
         }
     }
 
     cleanup() {
         clearInterval(this.tickInt);
         clearInterval(this.timerInt);
+        if (this.lobbyTimerInt) clearInterval(this.lobbyTimerInt);
         rooms.delete(this.id);
     }
 
     broadcastNames() {
-        const n = Array.from(this.players.values()).map(p => ({ i: p.id, nm: p.name, tm: p.team }));
+        const n = Array.from(this.players.values()).map(p => ({
+            i  : p.id,
+            nm : p.name,
+            tm : p.team,
+            rd : this.readyStates.get(p.id),   // true | false | undefined
+        }));
         this.broadcastRaw(JSON.stringify({ t: 'names', n }));
     }
 
@@ -388,11 +501,22 @@ class Room {
     }
 
     startGame() {
-        // Resolve factions from votes before clearing them
+        // Resolve factions from votes
         this.teamFactions[0] = this.resolveFaction(0);
         this.teamFactions[1] = this.resolveFaction(1);
-        this.factionVotes    = { 0: new Map(), 1: new Map() };
-        this.voteStarted     = false;
+
+        // Resolve map from votes — updates mapDef and cores
+        this.mapDef = this.resolveMap();
+        this.cores  = [
+            { id: 0, team: 0, x: this.mapDef.cores[0].x, y: this.mapDef.cores[0].y, hp: 2500, maxHp: 2500, r: 40 },
+            { id: 1, team: 1, x: this.mapDef.cores[1].x, y: this.mapDef.cores[1].y, hp: 2500, maxHp: 2500, r: 40 },
+        ];
+
+        // Reset vote/lobby state
+        this.factionVotes  = { 0: new Map(), 1: new Map() };
+        this.mapVotes      = new Map();
+        this.readyStates   = new Map();
+        this.inVotePhase   = false;
 
         this.phase   = PH.BUILD;
         this.timer   = BUILD_TIME;
@@ -1166,11 +1290,27 @@ wss.on('connection', (ws) => {
                 const player = room.players.get(id);
                 if (player) room.handleWallUpgrade(player, data);
 
-            } else if (data.t === 'vote' && room) {
+            } else if (data.t === 'vote' && room && room.inVotePhase) {
                 const player = room.players.get(id);
                 if (player && ['roe', 'bgm', 'epa'].includes(data.f)) {
                     room.factionVotes[player.team].set(id, data.f);
                     room.broadcastFactionVotes();
+                }
+
+            } else if (data.t === 'mvote' && room && room.inVotePhase) {
+                const player = room.players.get(id);
+                const mapId  = +data.m;
+                if (player && MAP_DEFS.some(m => m.id === mapId)) {
+                    room.mapVotes.set(id, mapId);
+                    room.broadcastMapVotes();
+                }
+
+            } else if (data.t === 'ready' && room) {
+                const player = room.players.get(id);
+                if (player && !room.inVotePhase && room.phase === PH.LOBBY) {
+                    room.readyStates.set(id, !!data.r);
+                    room.broadcastNames();   // re-send names so ready state propagates
+                    room.evaluateLobby();
                 }
 
             } else if (data.t === 'chat' && room) {
@@ -1199,7 +1339,7 @@ wss.on('connection', (ws) => {
 
 function findRoom() {
     for (const [id, r] of rooms) {
-        if (r.phase === PH.LOBBY && r.players.size < MAX_PLAYERS) return id;
+        if (r.phase === PH.LOBBY && !r.inVotePhase && r.players.size < MAX_PLAYERS) return id;
     }
     return crypto.randomBytes(4).toString('hex');
 }
