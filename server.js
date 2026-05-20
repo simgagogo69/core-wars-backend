@@ -238,11 +238,18 @@ function wireBuild(b) {
 
 // ─── Room ────────────────────────────────────────────────────────────────────
 class Room {
-    constructor(id) {
+    constructor(id, mode = 'casual') {
         this.id        = id;
+        this.mode      = mode;
+        this.maxPlayers = mode === 'ranked1v1' ? 2
+                        : mode === 'ranked2v2' ? 4
+                        : 8;   // casual / private
         this.players   = new Map();
         this.buildings = new Map();
         this.projs     = new Map();
+
+        this.rankSum   = 0;   // sum of all player ranks in this room
+        this.rankCount = 0;   // number of players (for avg rank calculation)
 
         this.phase     = PH.LOBBY;
         this.timer     = 0;
@@ -418,14 +425,19 @@ class Room {
         }, 1000);
     }
 
-    addPlayer(ws, id, name) {
+    addPlayer(ws, id, name, rank = 0) {
         let red = 0, blue = 0;
         for (const p of this.players.values()) p.team === 0 ? red++ : blue++;
         const team   = red <= blue ? 0 : 1;
         const spawn  = this.mapDef.spawns[team];
 
+        this.rankSum   += rank;
+        this.rankCount += 1;
+        const team   = red <= blue ? 0 : 1;
+        const spawn  = this.mapDef.spawns[team];
+
         this.players.set(id, {
-            id, ws, name, team,
+            id, ws, name, team, rank,
             x: spawn.x, y: spawn.y,
             r: 15, spd: 250,
             hp: 100, maxHp: 100,
@@ -462,6 +474,8 @@ class Room {
     }
 
     removePlayer(id) {
+        const p = this.players.get(id);
+        if (p) { this.rankSum = Math.max(0, this.rankSum - (p.rank || 0)); this.rankCount = Math.max(0, this.rankCount - 1); }
         if (this.players.size > 1) {
             this.events.push({ e: EV.PLAYER_LEAVE, i: id });
         }
@@ -1269,15 +1283,18 @@ wss.on('connection', (ws) => {
             const room = info.roomId ? rooms.get(info.roomId) : null;
 
             if (data.t === 'join') {
-                const roomId = data.r || findRoom();
-                if (!rooms.has(roomId)) rooms.set(roomId, new Room(roomId));
+                const mode   = ['ranked1v1','ranked2v2','casual','private'].includes(data.mode) ? data.mode : 'casual';
+                const rank   = Math.max(0, parseInt(data.rank) || 0);
+                // Private mode: always use the supplied room code (create if absent)
+                const roomId = data.r ? data.r : (mode === 'private' ? crypto.randomBytes(4).toString('hex') : findRoom(mode, rank));
+                if (!rooms.has(roomId)) rooms.set(roomId, new Room(roomId, data.r ? mode : mode));
                 const r = rooms.get(roomId);
-                if (r.players.size >= MAX_PLAYERS) {
+                if (r.players.size >= r.maxPlayers) {
                     ws.send(JSON.stringify({ t: 'err', msg: 'Room full' }));
                     return;
                 }
                 info.roomId = roomId;
-                r.addPlayer(ws, id, data.n || 'Pilot');
+                r.addPlayer(ws, id, data.n || 'Pilot', rank);
 
             } else if (data.t === 'i' && room) {
                 const player = room.players.get(id);
@@ -1347,10 +1364,42 @@ wss.on('connection', (ws) => {
     });
 });
 
-function findRoom() {
+function findRoom(mode, rank) {
+    const RANK_WINDOW = 8;  // max rank-point difference to be considered "similar"
+    let bestId   = null;
+    let bestDiff = Infinity;
+
     for (const [id, r] of rooms) {
-        if (r.phase === PH.LOBBY && !r.inVotePhase && r.players.size < MAX_PLAYERS) return id;
+        if (r.phase !== PH.LOBBY || r.inVotePhase) continue;
+        if (r.mode !== mode) continue;
+        if (r.players.size >= r.maxPlayers) continue;
+
+        if (mode === 'ranked1v1' || mode === 'ranked2v2') {
+            // Prefer rooms with closest average rank; hard-skip if too far away
+            const avgRank = r.rankCount > 0 ? r.rankSum / r.rankCount : rank;
+            const diff    = Math.abs(avgRank - rank);
+            if (diff <= RANK_WINDOW && diff < bestDiff) {
+                bestDiff = diff; bestId = id;
+            }
+        } else {
+            // Casual: first available room with this mode
+            return id;
+        }
     }
+
+    // If we found a rank-compatible room, use it; otherwise fall back to any
+    // available room of this mode (so ranked players always eventually match).
+    if (bestId) return bestId;
+
+    if (mode === 'ranked1v1' || mode === 'ranked2v2') {
+        // Fallback: any open ranked room of the right size (ignoring rank gap)
+        for (const [id, r] of rooms) {
+            if (r.phase === PH.LOBBY && !r.inVotePhase && r.mode === mode && r.players.size < r.maxPlayers)
+                return id;
+        }
+    }
+
+    // Create a fresh room
     return crypto.randomBytes(4).toString('hex');
 }
 
