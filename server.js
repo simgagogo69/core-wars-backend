@@ -41,6 +41,8 @@ const MAX_PLAYERS = 8;
 const BUILD_TIME  = 30;
 const LOBBY_TIME  = 120;  // 2-min lobby countdown (when 2+ players, nobody voted yet)
 const VOTE_TIME   = 25;   // seconds for the dedicated voting phase
+const WALL_W      = 16;   // wall collision box size — must match client GRID_SIZE
+const WALL_HALF   = 8;    // WALL_W / 2
 
 // ─── Map definitions ─────────────────────────────────────────────────────────
 // waterZones: array of {x,y,w,h} rectangles that are impassable water
@@ -616,9 +618,9 @@ class Room {
 
             for (const b of this.buildings.values()) {
                 if (b.type === 'w') {
-                    const rx = b.x - 25, ry = b.y - 25;
-                    if (circleRect(nx, player.y, player.r, rx, ry, 50, 50)) nx = player.x;
-                    if (circleRect(player.x, ny, player.r, rx, ry, 50, 50)) ny = player.y;
+                    const rx = b.x - WALL_HALF, ry = b.y - WALL_HALF;
+                    if (circleRect(nx, player.y, player.r, rx, ry, WALL_W, WALL_W)) nx = player.x;
+                    if (circleRect(player.x, ny, player.r, rx, ry, WALL_W, WALL_W)) ny = player.y;
                 } else if (b.type === 't') {
                     const tr = 18 + player.r;
                     if (Math.hypot(nx - b.x, player.y - b.y) < tr) nx = player.x;
@@ -817,7 +819,7 @@ class Room {
                     for (const [bid, b] of this.buildings) {
                         if (b.team === p.team) continue;
                         const hit =
-                            (b.type === 'w' && circleRect(p.x, p.y, p.r, b.x-25, b.y-25, 50, 50)) ||
+                            (b.type === 'w' && circleRect(p.x, p.y, p.r, b.x-WALL_HALF, b.y-WALL_HALF, WALL_W, WALL_W)) ||
                             (b.type === 't' && dist(p.x, p.y, b.x, b.y) < b.r + p.r);
                         if (hit) {
                             const dmg = p.bonusVsBldg ? Math.round(p.dmg * 1.5) : p.dmg;
@@ -973,7 +975,11 @@ class Room {
             }
         }
 
-        if (this.tickCount % SNAP_EVERY === 0) this.broadcastSnapshot();
+        // Force-broadcast immediately when the game just ended so the WIN event
+        // is never stranded in this.events by the early-return at the top of tick().
+        const justEnded = this.phase === PH.END && this._prevPhase !== PH.END;
+        this._prevPhase = this.phase;
+        if (justEnded || this.tickCount % SNAP_EVERY === 0) this.broadcastSnapshot();
     }
 
     spawnProjectile(x, y, a, team, ownerId, opts = {}) {
@@ -1176,7 +1182,7 @@ class Room {
         for (const [bid, b] of this.buildings) {
             if (b.team === attackingTeam) continue;
             const hit = b.type === 'w'
-                ? circleRect(cx, cy, radius, b.x - 25, b.y - 25, 50, 50)
+                ? circleRect(cx, cy, radius, b.x - WALL_HALF, b.y - WALL_HALF, WALL_W, WALL_W)
                 : dist(cx, cy, b.x, b.y) < radius + (b.r || 18);
             if (!hit) continue;
             const resist = (b.type === 'w' && b.exploResist !== undefined) ? b.exploResist : 1.0;
