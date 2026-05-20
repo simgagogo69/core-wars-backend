@@ -433,8 +433,6 @@ class Room {
 
         this.rankSum   += rank;
         this.rankCount += 1;
-        const team   = red <= blue ? 0 : 1;
-        const spawn  = this.mapDef.spawns[team];
 
         this.players.set(id, {
             id, ws, name, team, rank,
