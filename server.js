@@ -684,7 +684,7 @@ const FACTIONS = {
             dmg: 20, fireRate: 350, reloadTime: 1400,
             projSpd: 680, projR: 3, spread: 0.03,
             magSize: 12, range: 380, falloffStart: 220,
-            moveSpeedMult: 1.15,  // lightest, fastest
+            moveSpeedMult: 1.2,  // lightest, fastest
         },
         // ── Revolvers ─────────────────────────────────────────────────────────
         'revolver_heavy': {
@@ -692,7 +692,7 @@ const FACTIONS = {
             dmg: 55, fireRate: 700, reloadTime: 2800,
             projSpd: 720, projR: 5, spread: 0.02,
             magSize: 6, range: 500, falloffStart: 300,
-            moveSpeedMult: 1.05,  // compact sidearm
+            moveSpeedMult: 1.15,  // compact sidearm
         },
         // ── Shotguns ──────────────────────────────────────────────────────────
         'shotgun_pump': {
