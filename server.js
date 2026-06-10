@@ -577,27 +577,26 @@
 
     // hasUpgrades: only ROE gets the turret/wall upgrade tree
     // wallCost / turretCost: initial build price for this faction
-const FACTIONS = {
-    'roe': {
-        name: 'Revolutionaries of Earth', short: 'ROE',
-        wallCost: 8, turretCost: 25, hasUpgrades: true, baseTurret: 't', baseWall: 'w',
-        color: '#f59e0b',
-        desc: 'Jack of all trades. Cheap defenses, full upgrade tree. No clear weakness, no clear strength.',
-    },
-    'bgm': {
-        name: 'BlackenedGods Mining Corp', short: 'B.G.M. Corp',
-        wallCost: 15, turretCost: 35, hasUpgrades: true, baseTurret: 'bgm_t', baseWall: 'bgm_w',
-        color: '#f97316',
-        desc: 'Industrial powerhouse. Heavy costs, unique turret upgrade tree. Built like a fortress.',
-    },
-    'epa': {
-        name: 'Earthen Protection Agency', short: 'EPA',
-        wallCost: 12, turretCost: 28, hasUpgrades: true, baseTurret: 'epa_t', baseWall: 'epa_w',
-        color: '#22d3ee',
-        desc: 'Precision agency. Accurate, durable, expensive. Unique upgrade tree built for sustained defence.',
-    },
-};
-
+    const FACTIONS = {
+        'roe': {
+            name: 'Revolutionaries of Earth', short: 'ROE',
+            wallCost: 8, turretCost: 25, hasUpgrades: true, baseTurret: 't', baseWall: 'w',
+            color: '#f59e0b',
+            desc: 'Jack of all trades. Cheap defenses, full upgrade tree. No clear weakness, no clear strength.',
+        },
+        'bgm': {
+            name: 'BlackenedGods Mining Corp', short: 'B.G.M. Corp',
+            wallCost: 15, turretCost: 35, hasUpgrades: true, baseTurret: 'bgm_t', baseWall: 'bgm_w',
+            color: '#f97316',
+            desc: 'Industrial powerhouse. Heavy costs, unique turret upgrade tree. Built like a fortress.',
+        },
+        'epa': {
+            name: 'Earthen Protection Agency', short: 'EPA',
+            wallCost: 12, turretCost: 28, hasUpgrades: true, baseTurret: 'epa_t', baseWall: 'epa_w',
+            color: '#22d3ee',
+            desc: 'Precision agency. Accurate, durable, expensive. Unique upgrade tree built for sustained defence.',
+        },
+    };
 
     // ═══════════════════════════════════════════════════════════════════════════
     // WEAPON SYSTEM
@@ -684,7 +683,7 @@ const FACTIONS = {
             dmg: 20, fireRate: 350, reloadTime: 1400,
             projSpd: 680, projR: 3, spread: 0.03,
             magSize: 12, range: 380, falloffStart: 220,
-            moveSpeedMult: 1.2,  // lightest, fastest
+            moveSpeedMult: 1.25,  // lightest, fastest
         },
         // ── Revolvers ─────────────────────────────────────────────────────────
         'revolver_heavy': {
@@ -692,7 +691,7 @@ const FACTIONS = {
             dmg: 55, fireRate: 700, reloadTime: 2800,
             projSpd: 720, projR: 5, spread: 0.02,
             magSize: 6, range: 500, falloffStart: 300,
-            moveSpeedMult: 1.15,  // compact sidearm
+            moveSpeedMult: 1.2,  // compact sidearm
         },
         // ── Shotguns ──────────────────────────────────────────────────────────
         'shotgun_pump': {
@@ -1422,7 +1421,7 @@ const FACTIONS = {
     }
 
     function wireBuild(b) {
-        return { i: b.id, tp: b.type, st: b.subtype || b.type, tm: b.team,
+        return { i: b.id, tp: b.type, st: b.subtype || b.type, tm: b.team, lp: b.lastProduction || 0,
                 x: Math.round(b.x), y: Math.round(b.y),
                 hp: b.hp, mhp: b.maxHp, r: b.r || 0 };
     }
@@ -1836,7 +1835,8 @@ const FACTIONS = {
                 for (const wid of weaponIds) {
                     const w = WEAPON_DEFS[wid];
                     if (w) weapons[wid] = { id: w.id, name: w.name, category: w.category,
-                        dmg: w.dmg, fireRate: w.fireRate, magSize: w.magSize, range: w.range };
+                        dmg: w.dmg, fireRate: w.fireRate, magSize: w.magSize, range: w.range,
+                        moveSpeedMult: w.moveSpeedMult ?? 1.0 };
                 }
                 p.ws.send(JSON.stringify({
                     t        : 'opselect_start',
@@ -2482,13 +2482,8 @@ const FACTIONS = {
                         const mdx = driver.inp.dx, mdy = driver.inp.dy;
                         if (Math.hypot(mdx, mdy) > 0.05) veh.moveA = Math.atan2(mdy, mdx);
                         // (if not moving, keep previous moveA so legs hold their last direction)
-                        if (driver.inp.sh) {
-                            // Stop-to-shoot: freeze position while trigger is held
-                            nvx = veh.x; nvy = veh.y;
-                        } else {
-                            nvx = veh.x + driver.inp.dx * spd * dt;
-                            nvy = veh.y + driver.inp.dy * spd * dt;
-                        }
+                        nvx = veh.x + driver.inp.dx * spd * dt;
+                        nvy = veh.y + driver.inp.dy * spd * dt;
                     } else {
                         // ── Tank-style steering ────────────────────────────────────
                         const turnRate = vDef.turnRate || 2.2;
@@ -2497,13 +2492,8 @@ const FACTIONS = {
                         const throttle = driver.inp.dx * fwdX  + driver.inp.dy * fwdY;
                         const steer    = driver.inp.dx * sideX + driver.inp.dy * sideY;
                         veh.a += steer * turnRate * dt;
-                        if (driver.inp.sh && !vDef.isAPC) {
-                            // Stop-to-shoot: non-APC tank-style vehicles freeze while firing
-                            nvx = veh.x; nvy = veh.y;
-                        } else {
-                            nvx = veh.x + Math.cos(veh.a) * throttle * spd * dt;
-                            nvy = veh.y + Math.sin(veh.a) * throttle * spd * dt;
-                        }
+                        nvx = veh.x + Math.cos(veh.a) * throttle * spd * dt;
+                        nvy = veh.y + Math.sin(veh.a) * throttle * spd * dt;
                     }
 
                     // Map bounds
